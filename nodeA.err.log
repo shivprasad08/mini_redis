@@ -1,0 +1,2 @@
+2026-08-10 00:02:01,959 [INFO] __main__: gRPC server listening on 127.0.0.1:7380
+2026-08-10 00:02:01,961 [INFO] __main__: mini-redis server listening on ('127.0.0.1', 6380)

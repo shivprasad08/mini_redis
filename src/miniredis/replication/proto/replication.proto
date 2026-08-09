@@ -1,0 +1,19 @@
+syntax = "proto3";
+package miniredis.replication;
+
+service ReplicationService {
+  rpc ReplicateWrite (WriteOp) returns (Ack);
+}
+
+message WriteOp {
+  string op_type = 1;      // "SET", "DEL", "EXPIRE"
+  string key = 2;
+  bytes value = 3;         // empty for DEL
+  int64 ttl_seconds = 4;   // 0 if no TTL
+  int64 sequence = 5;      // monotonically increasing per-primary write counter
+}
+
+message Ack {
+  bool success = 1;
+  int64 applied_sequence = 2;
+}

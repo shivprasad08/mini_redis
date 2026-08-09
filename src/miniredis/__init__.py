@@ -1,0 +1,3 @@
+"""
+mini-redis package initialization.
+"""

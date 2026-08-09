@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: mini-redis
+Version: 0.1.0
+Summary: A distributed key-value store
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: grpcio>=1.59.0
+Requires-Dist: grpcio-tools>=1.59.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4.3; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.21.1; extra == "dev"
+
+# mini-redis
+
+A distributed key-value store written in Python.

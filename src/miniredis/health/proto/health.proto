@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package miniredis.health;
+
+service HealthService {
+	rpc Heartbeat (Ping) returns (Pong);
+}
+
+message Ping {
+	string sender_id = 1;
+	int64 timestamp_ms = 2;
+}
+
+message Pong {
+	string responder_id = 1;
+	string role = 2;
+	int64 timestamp_ms = 3;
+}

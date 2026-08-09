@@ -1,0 +1,13 @@
+2026-08-09 23:20:24,976 [INFO] __main__: gRPC server listening on 127.0.0.1:7381
+2026-08-09 23:20:24,978 [INFO] __main__: mini-redis server listening on ('127.0.0.1', 6381)
+2026-08-09 23:20:28,515 [WARNING] __main__: PRIMARY SUSPECTED DOWN
+2026-08-09 23:20:31,046 [ERROR] __main__: PRIMARY DECLARED DEAD
+2026-08-09 23:20:31,052 [INFO] miniredis.election.election: Node 127.0.0.1:7381 won the election
+2026-08-09 23:20:31,053 [INFO] miniredis.election.election: Node 127.0.0.1:7381 promoted itself to primary
+2026-08-09 23:20:42,918 [INFO] __main__: Connection opened: ('127.0.0.1', 52117)
+2026-08-09 23:20:44,927 [INFO] __main__: Client disconnected: ('127.0.0.1', 52117)
+2026-08-09 23:20:44,932 [INFO] __main__: Connection closed: ('127.0.0.1', 52117)
+2026-08-09 23:33:20,768 [INFO] __main__: Connection opened: ('127.0.0.1', 52488)
+2026-08-09 23:34:11,827 [INFO] __main__: Client disconnected: ('127.0.0.1', 52488)
+2026-08-09 23:34:11,829 [INFO] __main__: Connection closed: ('127.0.0.1', 52488)
+2026-08-09 23:34:11,830 [INFO] __main__: Shutting down.
