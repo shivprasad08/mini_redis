@@ -1,0 +1,106 @@
+# docker-compose.yml
+#
+# Multi-node mini-redis cluster topology:
+# - 1 Primary node (node-a)
+# - 3 Replica nodes (node-b, node-c, node-d)
+#
+# Inter-node gRPC communication uses Docker container hostnames on the shared
+# 'miniredis-net' bridge network instead of loopback IPs.
+#
+# Client-facing TCP ports published to host:
+# - Primary (node-a): host port 6380 -> container port 6380
+# - Replica 1 (node-b): host port 6381 -> container port 6380
+# - Replica 2 (node-c): host port 6382 -> container port 6380
+# - Replica 3 (node-d): host port 6383 -> container port 6380
+
+services:
+  node-a:
+    build: .
+    container_name: miniredis-node-a
+    hostname: node-a
+    command: >
+      --role primary
+      --node-id node-a
+      --host 0.0.0.0
+      --port 6380
+      --grpc-port 6381
+      --replica-of node-b:6381
+      --replica-of node-c:6381
+      --replica-of node-d:6381
+      --peer node-b,node-b:6381,node-b:6380
+      --peer node-c,node-c:6381,node-c:6380
+      --peer node-d,node-d:6381,node-d:6380
+    ports:
+      - "6380:6380"
+    networks:
+      - miniredis-net
+
+  node-b:
+    build: .
+    container_name: miniredis-node-b
+    hostname: node-b
+    command: >
+      --role replica
+      --node-id node-b
+      --host 0.0.0.0
+      --port 6380
+      --grpc-port 6381
+      --primary-address node-a:6381
+      --primary-node-id node-a
+      --peer node-a,node-a:6381,node-a:6380
+      --peer node-c,node-c:6381,node-c:6380
+      --peer node-d,node-d:6381,node-d:6380
+    ports:
+      - "6381:6380"
+    depends_on:
+      - node-a
+    networks:
+      - miniredis-net
+
+  node-c:
+    build: .
+    container_name: miniredis-node-c
+    hostname: node-c
+    command: >
+      --role replica
+      --node-id node-c
+      --host 0.0.0.0
+      --port 6380
+      --grpc-port 6381
+      --primary-address node-a:6381
+      --primary-node-id node-a
+      --peer node-a,node-a:6381,node-a:6380
+      --peer node-b,node-b:6381,node-b:6380
+      --peer node-d,node-d:6381,node-d:6380
+    ports:
+      - "6382:6380"
+    depends_on:
+      - node-a
+    networks:
+      - miniredis-net
+
+  node-d:
+    build: .
+    container_name: miniredis-node-d
+    hostname: node-d
+    command: >
+      --role replica
+      --node-id node-d
+      --host 0.0.0.0
+      --port 6380
+      --grpc-port 6381
+      --primary-address node-a:6381
+      --primary-node-id node-a
+      --peer node-a,node-a:6381,node-a:6380
+      --peer node-b,node-b:6381,node-b:6380
+      --peer node-c,node-c:6381,node-c:6380
+    ports:
+      - "6383:6380"
+    depends_on:
+      - node-a
+    networks:
+      - miniredis-net
+
+networks:
+  miniredis-net:
+    driver: bridge

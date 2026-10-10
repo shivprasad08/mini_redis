@@ -26,3 +26,5 @@ asyncio_mode = "auto"
 [project.scripts]
 miniredis-server = "miniredis.server:main"
 miniredis-cli = "miniredis.cli_client:main"
+miniredis-benchmark = "miniredis.benchmark:main"
+miniredis-timeline = "miniredis.timeline:main"

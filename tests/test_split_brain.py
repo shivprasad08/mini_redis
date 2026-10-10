@@ -10,6 +10,7 @@ for a live evaluator demo.
 from __future__ import annotations
 
 import asyncio
+import socket
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -58,6 +59,9 @@ class NodeHandle:
         if self.failure_detector is not None:
             await self.failure_detector.stop()
         await self.majority_monitor.stop()
+        if self.dispatcher.replicator is not None:
+            await self.dispatcher.replicator.aclose()
+        await self.election.aclose()
         self.tcp_server.close()
         await self.tcp_server.wait_closed()
         await self.grpc_server.stop(grace=0)
@@ -69,6 +73,10 @@ class PartitionHarness:
     def __init__(self, node_infos: dict[str, NodeInfo]) -> None:
         self._node_infos = dict(node_infos)
         self._blocked_pairs: set[frozenset[str]] = set()
+
+    @property
+    def node_infos(self) -> dict[str, NodeInfo]:
+        return dict(self._node_infos)
 
     def cut(self, group_a: set[str], group_b: set[str]) -> None:
         for left in group_a:
@@ -108,6 +116,23 @@ async def _wait_for(predicate: Callable[[], bool], timeout: float = 4.0, interva
 def _split_address(address: str) -> tuple[str, int]:
     host, port_text = address.split(":", 1)
     return host, int(port_text)
+
+
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _make_node_infos() -> dict[str, NodeInfo]:
+    return {
+        node_id: NodeInfo(
+            node_id,
+            f"127.0.0.1:{_free_local_port()}",
+            f"127.0.0.1:{_free_local_port()}",
+        )
+        for node_id in ("node-a", "node-b", "node-c", "node-d", "node-e")
+    }
 
 
 async def _start_node(
@@ -150,7 +175,9 @@ async def _start_node(
         ReplicaServicer(store), grpc_server
     )
     election_pb2_grpc.add_ElectionServiceServicer_to_server(election.servicer, grpc_server)
-    grpc_server.add_insecure_port(info.grpc_address)
+    grpc_port = grpc_server.add_insecure_port(info.grpc_address)
+    if grpc_port == 0:
+        raise RuntimeError(f"failed to bind gRPC server to {info.grpc_address}")
     await grpc_server.start()
 
     majority_monitor = ClusterMajorityMonitor(
@@ -217,13 +244,7 @@ async def _start_node(
 
 
 async def _start_cluster(partition: PartitionHarness) -> dict[str, NodeHandle]:
-    node_infos = {
-        "node-a": NodeInfo("node-a", "127.0.0.1:64001", "127.0.0.1:65001"),
-        "node-b": NodeInfo("node-b", "127.0.0.1:64002", "127.0.0.1:65002"),
-        "node-c": NodeInfo("node-c", "127.0.0.1:64003", "127.0.0.1:65003"),
-        "node-d": NodeInfo("node-d", "127.0.0.1:64004", "127.0.0.1:65004"),
-        "node-e": NodeInfo("node-e", "127.0.0.1:64005", "127.0.0.1:65005"),
-    }
+    node_infos = dict(partition.node_infos)
     peers = {
         node_id: PeerEndpoint(node_id=node_id, grpc_address=info.grpc_address, tcp_address=info.tcp_address)
         for node_id, info in node_infos.items()
@@ -254,13 +275,7 @@ async def _stop_cluster(handles: dict[str, NodeHandle]) -> None:
 
 
 async def _partition_majority_cluster() -> tuple[dict[str, NodeHandle], PartitionHarness]:
-    node_infos = {
-        "node-a": NodeInfo("node-a", "127.0.0.1:64001", "127.0.0.1:65001"),
-        "node-b": NodeInfo("node-b", "127.0.0.1:64002", "127.0.0.1:65002"),
-        "node-c": NodeInfo("node-c", "127.0.0.1:64003", "127.0.0.1:65003"),
-        "node-d": NodeInfo("node-d", "127.0.0.1:64004", "127.0.0.1:65004"),
-        "node-e": NodeInfo("node-e", "127.0.0.1:64005", "127.0.0.1:65005"),
-    }
+    node_infos = _make_node_infos()
     partition = PartitionHarness(node_infos)
     handles = await _start_cluster(partition)
     return handles, partition
@@ -281,7 +296,8 @@ async def test_majority_side_elects_and_minority_refuses_writes() -> None:
         await _wait_for(lambda: handles["node-c"].election.current_primary_id == "node-e")
         await _wait_for(lambda: handles["node-b"].dispatcher.write_gate.can_serve_writes is False)
 
-        majority_reader, majority_writer = await _open_client("127.0.0.1", 65005)
+        majority_host, majority_port = _split_address(handles["node-e"].info.tcp_address)
+        majority_reader, majority_writer = await _open_client(majority_host, majority_port)
         try:
             majority_writer.write(_make_command(b"SET", b"majority-key", b"majority-val"))
             await majority_writer.drain()
@@ -291,7 +307,8 @@ async def test_majority_side_elects_and_minority_refuses_writes() -> None:
             majority_writer.close()
             await majority_writer.wait_closed()
 
-        minority_reader, minority_writer = await _open_client("127.0.0.1", 65002)
+        minority_host, minority_port = _split_address(handles["node-b"].info.tcp_address)
+        minority_reader, minority_writer = await _open_client(minority_host, minority_port)
         try:
             minority_writer.write(_make_command(b"SET", b"minority-key", b"minority-val"))
             await minority_writer.drain()
@@ -334,7 +351,8 @@ async def test_isolated_primary_demotes_itself_when_majority_is_lost() -> None:
         await _wait_for(lambda: handles["node-a"].dispatcher.write_gate.can_serve_writes is False)
         await _wait_for(lambda: handles["node-a"].election.role == "replica")
 
-        reader, writer = await _open_client("127.0.0.1", 65001)
+        host, port = _split_address(handles["node-a"].info.tcp_address)
+        reader, writer = await _open_client(host, port)
         try:
             writer.write(_make_command(b"SET", b"cut-key", b"cut-val"))
             await writer.drain()
@@ -343,6 +361,22 @@ async def test_isolated_primary_demotes_itself_when_majority_is_lost() -> None:
         finally:
             writer.close()
             await writer.wait_closed()
+    finally:
+        await _stop_cluster(handles)
+
+
+@pytest.mark.asyncio
+async def test_highest_priority_minority_node_refuses_promotion() -> None:
+    handles, partition = await _partition_majority_cluster()
+    try:
+        # node-e is the highest-priority node, but it is isolated with only
+        # node-d. Priority cannot override the fixed five-node majority rule.
+        partition.cut({"node-a", "node-b", "node-c"}, {"node-d", "node-e"})
+        await handles["node-e"].election.start_election()
+
+        assert handles["node-e"].election.role == "replica"
+        assert handles["node-e"].dispatcher.write_gate.can_serve_writes is False
+        assert handles["node-e"].election.current_primary_id == ""
     finally:
         await _stop_cluster(handles)
 

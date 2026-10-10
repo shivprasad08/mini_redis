@@ -9,10 +9,12 @@ service HealthService {
 message Ping {
 	string sender_id = 1;
 	int64 timestamp_ms = 2;
+	uint64 lamport_timestamp = 3;
 }
 
 message Pong {
 	string responder_id = 1;
 	string role = 2;
 	int64 timestamp_ms = 3;
+	uint64 lamport_timestamp = 4;
 }

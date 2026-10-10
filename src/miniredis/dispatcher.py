@@ -22,7 +22,7 @@ Supported commands
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Callable, Optional
 
 from miniredis.protocol import (
     Command,
@@ -59,12 +59,14 @@ class Dispatcher:
         replicator: Optional[Replicator] = None,
         writes_enabled: bool = True,
         write_gate: Optional[WriteAdmissionGate] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._store = store
         self._pubsub = pubsub
         self._replicator = replicator
         self._writes_enabled = writes_enabled
         self._write_gate = write_gate or WriteAdmissionGate(can_serve_writes=writes_enabled)
+        self._clock = clock
 
     def set_replicator(self, replicator: Optional[Replicator]) -> None:
         """Swap the replication backend at runtime."""
@@ -156,13 +158,30 @@ class Dispatcher:
             if ttl <= 0:
                 return encode_error("ERR invalid expire time in 'SET' command")
 
+        expiry_deadline_ms = (
+            int(self._clock() * 1000) + (ttl * 1000)
+            if ttl is not None and self._clock is not None
+            else 0
+        )
+
         if self._replicator:
             # Quorum mode is decided before the primary mutates local state so
             # a failed quorum leaves the store unchanged and avoids rollback.
-            if not await self._replicator.propagate_write("SET", key, value, ttl or 0):
+            if not await self._replicator.propagate_write(
+                "SET",
+                key,
+                value,
+                ttl or 0,
+                expiry_deadline_ms=expiry_deadline_ms,
+            ):
                 return encode_error("ERR quorum not reached, write not applied")
 
-        self._store.set(key, value, ttl_seconds=ttl)
+        self._store.set(
+            key,
+            value,
+            ttl_seconds=ttl,
+            expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
+        )
 
         return encode_simple_string("OK")
 
@@ -208,12 +227,27 @@ class Dispatcher:
         key = command.args[0]
         existed = self._store.exists(key)
 
+        expiry_deadline_ms = (
+            int(self._clock() * 1000) + (seconds * 1000)
+            if self._clock is not None
+            else 0
+        )
+
         if existed and self._replicator:
             # Preserve the async-vs-quorum difference at the commit point.
-            if not await self._replicator.propagate_write("EXPIRE", key, ttl_seconds=seconds):
+            if not await self._replicator.propagate_write(
+                "EXPIRE",
+                key,
+                ttl_seconds=seconds,
+                expiry_deadline_ms=expiry_deadline_ms,
+            ):
                 return encode_error("ERR quorum not reached, write not applied")
 
-        result = self._store.expire(key, seconds) if existed else 0
+        result = (
+            self._store.expire_at(key, expiry_deadline_ms / 1000.0)
+            if existed and expiry_deadline_ms
+            else self._store.expire(key, seconds) if existed else 0
+        )
 
         return encode_integer(result)
 

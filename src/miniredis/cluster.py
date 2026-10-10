@@ -19,6 +19,7 @@ import grpc
 
 from miniredis.health.proto import health_pb2
 from miniredis.health.proto import health_pb2_grpc
+from miniredis.logical_clock import LamportClock, log_lamport_event
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class ClusterMajorityMonitor:
         heartbeat_interval_seconds: float = 1.0,
         heartbeat_timeout_seconds: float = 0.5,
         rpc_filter: Optional[Callable[[str, str], bool]] = None,
+        lamport_clock: Optional[LamportClock] = None,
     ) -> None:
         self._node_id = node_id
         self._peer_health_addresses = dict(peer_health_addresses)
@@ -75,6 +77,7 @@ class ClusterMajorityMonitor:
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         self._heartbeat_timeout_seconds = heartbeat_timeout_seconds
         self._rpc_filter = rpc_filter
+        self._lamport_clock = lamport_clock or LamportClock()
 
         self._stubs: dict[str, health_pb2_grpc.HealthServiceStub] = {}
         self._channels: list[grpc.aio.Channel] = []
@@ -157,9 +160,29 @@ class ClusterMajorityMonitor:
         if self._rpc_filter is not None and not self._rpc_filter("Heartbeat", self._peer_health_addresses[peer_id]):
             return False
 
-        request = health_pb2.Ping(sender_id=self._node_id, timestamp_ms=0)
+        request_ts = await self._lamport_clock.tick()
+        log_lamport_event(
+            timestamp=request_ts,
+            node_id=self._node_id,
+            event_type="heartbeat_send",
+            message_id=peer_id,
+            description="majority probe",
+        )
+        request = health_pb2.Ping(
+            sender_id=self._node_id,
+            timestamp_ms=0,
+            lamport_timestamp=request_ts,
+        )
         try:
-            await asyncio.wait_for(stub.Heartbeat(request), timeout=self._heartbeat_timeout_seconds)
+            response = await asyncio.wait_for(stub.Heartbeat(request), timeout=self._heartbeat_timeout_seconds)
+            recv_ts = await self._lamport_clock.receive(response.lamport_timestamp)
+            log_lamport_event(
+                timestamp=recv_ts,
+                node_id=self._node_id,
+                event_type="heartbeat_recv",
+                message_id=response.responder_id,
+                description="majority probe response",
+            )
             return True
         except (asyncio.TimeoutError, grpc.aio.AioRpcError, ConnectionError):
             return False

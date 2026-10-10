@@ -12,10 +12,12 @@ import pytest
 import grpc
 
 from miniredis.dispatcher import Dispatcher, pubsub_message_framer
+from miniredis.cluster import WriteAdmissionGate
 from miniredis.protocol import Command
 from miniredis.pubsub import PubSub
 from miniredis.storage import Store
 from miniredis.replication.replicator import ReplicaServicer, Replicator
+from miniredis.replication.proto import replication_pb2
 from miniredis.replication.proto import replication_pb2_grpc
 
 
@@ -33,6 +35,13 @@ class SlowReplicaServicer(ReplicaServicer):
     ):
         await asyncio.sleep(self._delay_seconds)
         return await super().ReplicateWrite(request, context)
+
+
+class _GrpcContext:
+    """Minimal context for direct ReplicaServicer unit tests."""
+
+    def peer(self) -> str:
+        return "test-peer"
 
 
 async def _start_replica_server(
@@ -200,12 +209,15 @@ async def test_slow_replica_timeout_counts_as_non_ack() -> None:
 
 @pytest.mark.asyncio
 async def test_quorum_mode_waits_while_async_returns_immediately() -> None:
-    store, target, server = await _start_replica_server(
+    async_store, async_target, async_server = await _start_replica_server(
+        lambda replica_store: SlowReplicaServicer(replica_store, delay_seconds=0.15)
+    )
+    quorum_store, quorum_target, quorum_server = await _start_replica_server(
         lambda replica_store: SlowReplicaServicer(replica_store, delay_seconds=0.15)
     )
 
-    async_replicator = Replicator([target], total_cluster_size=2, write_mode="async", write_timeout_seconds=0.5)
-    quorum_replicator = Replicator([target], total_cluster_size=2, write_mode="quorum", write_timeout_seconds=0.5)
+    async_replicator = Replicator([async_target], total_cluster_size=2, write_mode="async", write_timeout_seconds=0.5)
+    quorum_replicator = Replicator([quorum_target], total_cluster_size=2, write_mode="quorum", write_timeout_seconds=0.5)
 
     try:
         async_start = time.perf_counter()
@@ -218,6 +230,180 @@ async def test_quorum_mode_waits_while_async_returns_immediately() -> None:
 
         assert async_duration < 0.05
         assert quorum_duration >= 0.12
-        assert store.get(b"quorum-latency-key") == b"quorum-val"
+        assert quorum_store.get(b"quorum-latency-key") == b"quorum-val"
     finally:
+        await async_server.stop(grace=0)
+        await quorum_server.stop(grace=0)
+
+
+def test_replicator_rejects_invalid_simulated_latency() -> None:
+    for latency in (-1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            Replicator([], total_cluster_size=1, simulate_latency_ms=latency)
+
+
+@pytest.mark.asyncio
+async def test_zero_simulated_latency_preserves_normal_replication() -> None:
+    store, target, server = await _start_replica_server()
+    replicator = Replicator([target], total_cluster_size=2, simulate_latency_ms=0)
+
+    try:
+        await replicator.propagate("SET", b"latency-zero", b"ok")
+        await asyncio.sleep(0.1)
+        assert store.get(b"latency-zero") == b"ok"
+    finally:
+        await replicator.aclose()
         await server.stop(grace=0)
+
+
+@pytest.mark.asyncio
+async def test_nonzero_simulated_latency_delays_quorum_rpc() -> None:
+    store, target, server = await _start_replica_server()
+    replicator = Replicator(
+        [target],
+        total_cluster_size=2,
+        write_mode="quorum",
+        write_timeout_seconds=0.5,
+        simulate_latency_ms=60,
+    )
+
+    try:
+        started = time.perf_counter()
+        assert await replicator.propagate_quorum("SET", b"delayed", b"ok")
+        elapsed = time.perf_counter() - started
+
+        assert elapsed >= 0.045
+        assert store.get(b"delayed") == b"ok"
+    finally:
+        await replicator.aclose()
+        await server.stop(grace=0)
+
+
+@pytest.mark.asyncio
+async def test_simulated_latency_counts_against_quorum_timeout() -> None:
+    store, target, server = await _start_replica_server()
+    replicator = Replicator(
+        [target],
+        total_cluster_size=2,
+        write_mode="quorum",
+        write_timeout_seconds=0.02,
+        simulate_latency_ms=80,
+    )
+
+    try:
+        assert await replicator.propagate_quorum("SET", b"too-slow", b"nope") is False
+        assert store.get(b"too-slow") is None
+    finally:
+        await replicator.aclose()
+        await server.stop(grace=0)
+
+
+@pytest.mark.asyncio
+async def test_failed_quorum_recovers_after_connectivity_returns() -> None:
+    stores: list[Store] = []
+    servers: list[grpc.aio.Server] = []
+    targets: list[str] = []
+    blocked = True
+
+    try:
+        for _ in range(2):
+            store, target, server = await _start_replica_server()
+            stores.append(store)
+            targets.append(target)
+            servers.append(server)
+
+        def rpc_filter(_: str, target: str) -> bool:
+            return not blocked
+
+        gate = WriteAdmissionGate()
+        replicator = Replicator(
+            targets,
+            total_cluster_size=3,
+            write_mode="quorum",
+            write_timeout_seconds=0.2,
+            write_gate=gate,
+            rpc_filter=rpc_filter,
+        )
+        dispatcher = Dispatcher(Store(), PubSub(pubsub_message_framer), replicator, write_gate=gate)
+
+        failed = await dispatcher.handle_command(
+            Command(name="SET", args=[b"recover-key", b"first-attempt"]), object()
+        )
+        assert failed == b"-ERR quorum not reached, write not applied\r\n"
+        assert gate.can_serve_writes is True
+
+        blocked = False
+        succeeded = await dispatcher.handle_command(
+            Command(name="SET", args=[b"recover-key", b"second-attempt"]), object()
+        )
+        assert succeeded == b"+OK\r\n"
+        await asyncio.sleep(0.05)
+        values = [store.get(b"recover-key") for store in stores]
+        assert values == [b"second-attempt", b"second-attempt"], values
+    finally:
+        await asyncio.gather(*(server.stop(grace=0) for server in servers))
+
+
+@pytest.mark.asyncio
+async def test_replica_rejects_duplicates_gaps_and_obsolete_epochs() -> None:
+    store = Store()
+    servicer = ReplicaServicer(store)
+    context = _GrpcContext()
+
+    first = await servicer.ReplicateWrite(
+        replication_pb2.WriteOp(
+            op_type="SET",
+            key="epoch-key",
+            value=b"epoch-one",
+            sequence=1,
+            epoch=10,
+        ),
+        context,
+    )
+    duplicate = await servicer.ReplicateWrite(
+        replication_pb2.WriteOp(
+            op_type="SET",
+            key="epoch-key",
+            value=b"duplicate",
+            sequence=1,
+            epoch=10,
+        ),
+        context,
+    )
+    gap = await servicer.ReplicateWrite(
+        replication_pb2.WriteOp(
+            op_type="SET",
+            key="epoch-key",
+            value=b"gap",
+            sequence=3,
+            epoch=10,
+        ),
+        context,
+    )
+    new_epoch = await servicer.ReplicateWrite(
+        replication_pb2.WriteOp(
+            op_type="SET",
+            key="epoch-key",
+            value=b"epoch-two",
+            sequence=1,
+            epoch=11,
+        ),
+        context,
+    )
+    obsolete = await servicer.ReplicateWrite(
+        replication_pb2.WriteOp(
+            op_type="SET",
+            key="epoch-key",
+            value=b"obsolete",
+            sequence=2,
+            epoch=10,
+        ),
+        context,
+    )
+
+    assert first.success is True
+    assert duplicate.success is False
+    assert gap.success is False
+    assert new_epoch.success is True
+    assert obsolete.success is False
+    assert store.get(b"epoch-key") == b"epoch-two"

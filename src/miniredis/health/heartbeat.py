@@ -19,6 +19,7 @@ import grpc
 
 from miniredis.health.proto import health_pb2
 from miniredis.health.proto import health_pb2_grpc
+from miniredis.logical_clock import LamportClock, log_lamport_event
 
 logger = logging.getLogger(__name__)
 
@@ -33,20 +34,43 @@ def _now_ms() -> int:
 class HealthServicer(health_pb2_grpc.HealthServiceServicer):
 	"""Responds to heartbeats with this node's live identity."""
 
-	def __init__(self, node_id: str, role: Literal["primary", "replica"]) -> None:
+	def __init__(
+		self,
+		node_id: str,
+		role: Literal["primary", "replica"],
+		lamport_clock: Optional[LamportClock] = None,
+	) -> None:
 		self._node_id = node_id
 		self._role = role
+		self._lamport_clock = lamport_clock or LamportClock()
 
 	async def Heartbeat(
 		self,
 		request: health_pb2.Ping,
 		context: grpc.aio.ServicerContext,
 	) -> health_pb2.Pong:
-		del request, context
+		del context
+		ts = await self._lamport_clock.receive(request.lamport_timestamp)
+		log_lamport_event(
+			timestamp=ts,
+			node_id=self._node_id,
+			event_type="heartbeat_recv",
+			message_id=request.sender_id or "unknown",
+			description="received heartbeat",
+		)
+		response_ts = await self._lamport_clock.tick()
+		log_lamport_event(
+			timestamp=response_ts,
+			node_id=self._node_id,
+			event_type="heartbeat_send",
+			message_id=request.sender_id or "unknown",
+			description="sent heartbeat response",
+		)
 		return health_pb2.Pong(
 			responder_id=self._node_id,
 			role=self._role,
 			timestamp_ms=_now_ms(),
+			lamport_timestamp=response_ts,
 		)
 
 
@@ -67,6 +91,7 @@ class FailureDetector:
 		failure_threshold: int = 3,
 		sender_id: str = "",
 		rpc_filter: Optional[Callable[[str, str], bool]] = None,
+		lamport_clock: Optional[LamportClock] = None,
 	) -> None:
 		if failure_threshold <= 0:
 			raise ValueError("failure_threshold must be positive")
@@ -78,6 +103,7 @@ class FailureDetector:
 		self._failure_threshold = failure_threshold
 		self._sender_id = sender_id
 		self._rpc_filter = rpc_filter
+		self._lamport_clock = lamport_clock or LamportClock()
 
 		self._channel = grpc.aio.insecure_channel(peer_address)
 		self._stub = health_pb2_grpc.HealthServiceStub(self._channel)
@@ -164,14 +190,33 @@ class FailureDetector:
 			logger.exception("Failure detector for %s stopped unexpectedly", self._peer_node_id)
 
 	async def _probe_once(self) -> None:
-		request = health_pb2.Ping(sender_id=self._sender_id, timestamp_ms=_now_ms())
+		request_ts = await self._lamport_clock.tick()
+		log_lamport_event(
+			timestamp=request_ts,
+			node_id=self._sender_id or "unknown",
+			event_type="heartbeat_send",
+			message_id=self._peer_node_id,
+			description="sent heartbeat",
+		)
+		request = health_pb2.Ping(
+			sender_id=self._sender_id,
+			timestamp_ms=_now_ms(),
+			lamport_timestamp=request_ts,
+		)
 		try:
 			if self._rpc_filter is not None and not self._rpc_filter("Heartbeat", self._peer_address):
 				raise ConnectionError("partitioned")
 			response = await asyncio.wait_for(
 				self._stub.Heartbeat(request), timeout=self._heartbeat_timeout_seconds
 			)
-			del response
+			recv_ts = await self._lamport_clock.receive(response.lamport_timestamp)
+			log_lamport_event(
+				timestamp=recv_ts,
+				node_id=self._sender_id or "unknown",
+				event_type="heartbeat_recv",
+				message_id=response.responder_id,
+				description="received heartbeat response",
+			)
 			self._missed_heartbeats = 0
 			await self._set_state("alive")
 		except (asyncio.TimeoutError, grpc.aio.AioRpcError, ConnectionError):

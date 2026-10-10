@@ -102,7 +102,7 @@ async def _start_node(
         grpc_address="",
         peers=peers,
         dispatcher=dispatcher,
-        total_cluster_size=len(peers) + 1,
+        total_cluster_size=len(peers),
         failure_detector=None,
         write_gate=write_gate,
         role=role,
@@ -179,9 +179,9 @@ async def _start_node(
 @pytest.mark.asyncio
 async def test_primary_death_triggers_highest_priority_replacement() -> None:
     topology = {
-        "node-a": ("127.0.0.1:41001", "127.0.0.1:51001"),
-        "node-b": ("127.0.0.1:41002", "127.0.0.1:51002"),
-        "node-c": ("127.0.0.1:41003", "127.0.0.1:51003"),
+        "node-a": ("127.0.0.1:41001", "127.0.0.1:31001"),
+        "node-b": ("127.0.0.1:41002", "127.0.0.1:31002"),
+        "node-c": ("127.0.0.1:41003", "127.0.0.1:31003"),
     }
     peers = _peer_map(topology)
 

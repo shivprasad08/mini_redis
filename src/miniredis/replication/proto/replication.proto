@@ -10,10 +10,15 @@ message WriteOp {
   string key = 2;
   bytes value = 3;         // empty for DEL
   int64 ttl_seconds = 4;   // 0 if no TTL
-  int64 sequence = 5;      // monotonically increasing per-primary write counter
+  int64 sequence = 5;      // monotonically increasing within an epoch
+  uint64 epoch = 6;        // monotonically increasing leadership epoch
+  uint64 lamport_timestamp = 7;
+  int64 expiry_deadline_ms = 8; // 0 if no TTL; corrected-clock absolute deadline
 }
 
 message Ack {
   bool success = 1;
   int64 applied_sequence = 2;
+  uint64 epoch = 3;
+  uint64 lamport_timestamp = 4;
 }

@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package miniredis.time_sync;
+
+service TimeService {
+  rpc GetTime (TimeRequest) returns (TimeResponse);
+}
+
+message TimeRequest {
+  string requester_id = 1;
+  int64 client_send_time_ms = 2;
+  uint64 lamport_timestamp = 3;
+}
+
+message TimeResponse {
+  string responder_id = 1;
+  int64 server_time_ms = 2;
+  uint64 lamport_timestamp = 3;
+}

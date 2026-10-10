@@ -65,6 +65,7 @@ class Store:
         key: bytes,
         value: bytes,
         ttl_seconds: Optional[int] = None,
+        expires_at: Optional[float] = None,
     ) -> None:
         """Set *key* to *value*, optionally with a TTL in seconds.
 
@@ -72,7 +73,9 @@ class Store:
         removed (the key becomes persistent).
         """
         self._data[key] = value
-        if ttl_seconds is not None:
+        if expires_at is not None:
+            self._expiries[key] = expires_at
+        elif ttl_seconds is not None:
             self._expiries[key] = self._clock() + ttl_seconds
         else:
             # Overwriting a key clears its old TTL.
@@ -97,6 +100,14 @@ class Store:
         if key not in self._data:
             return 0
         self._expiries[key] = self._clock() + ttl_seconds
+        return 1
+
+    def expire_at(self, key: bytes, expires_at: float) -> int:
+        """Set an absolute expiry deadline using the store's clock domain."""
+        self._evict_if_expired(key)
+        if key not in self._data:
+            return 0
+        self._expiries[key] = expires_at
         return 1
 
     def exists(self, key: bytes) -> bool:

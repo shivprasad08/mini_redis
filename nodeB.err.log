@@ -1,8 +1,8 @@
-2026-08-10 00:02:01,971 [INFO] __main__: gRPC server listening on 127.0.0.1:7381
-2026-08-10 00:02:01,973 [INFO] __main__: mini-redis server listening on ('127.0.0.1', 6381)
-2026-08-10 00:02:04,494 [WARNING] __main__: PRIMARY SUSPECTED DOWN
-2026-08-10 00:02:07,052 [ERROR] __main__: PRIMARY DECLARED DEAD
-2026-08-10 00:02:07,057 [INFO] __main__: PRIMARY RECOVERED
-2026-08-10 00:02:07,059 [INFO] miniredis.election.election: Node node-b now follows primary node-c
-2026-08-10 00:02:07,061 [INFO] miniredis.election.election: Node node-b standing down for higher-priority coordinator
-2026-08-10 00:02:31,300 [INFO] __main__: Shutting down.
+2026-08-10 07:43:27,582 [INFO] __main__: gRPC server listening on 127.0.0.1:7381
+2026-08-10 07:43:27,584 [INFO] __main__: mini-redis server listening on ('127.0.0.1', 6381)
+2026-08-10 07:44:09,623 [WARNING] __main__: PRIMARY SUSPECTED DOWN
+2026-08-10 07:44:12,150 [ERROR] __main__: PRIMARY DECLARED DEAD
+2026-08-10 07:44:12,157 [INFO] miniredis.election.election: Node node-b standing down for higher-priority coordinator
+2026-08-10 07:44:12,161 [INFO] __main__: PRIMARY RECOVERED
+2026-08-10 07:44:12,162 [INFO] miniredis.election.election: Node node-b now follows primary node-c
+2026-08-10 07:48:05,319 [INFO] __main__: Shutting down.

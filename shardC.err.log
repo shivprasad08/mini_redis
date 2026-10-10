@@ -1,0 +1,5 @@
+2026-08-17 11:44:25,919 [INFO] __main__: gRPC server listening on 127.0.0.1:7382
+2026-08-17 11:44:25,921 [INFO] __main__: mini-redis server listening on ('127.0.0.1', 6382)
+2026-08-17 11:44:33,055 [INFO] __main__: Connection opened: ('127.0.0.1', 58537)
+2026-08-17 11:45:13,425 [INFO] __main__: Client disconnected: ('127.0.0.1', 58537)
+2026-08-17 11:45:13,428 [INFO] __main__: Connection closed: ('127.0.0.1', 58537)

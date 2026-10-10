@@ -12,4 +12,155 @@ Requires-Dist: pytest-asyncio>=0.21.1; extra == "dev"
 
 # mini-redis
 
-A distributed key-value store written in Python.
+A distributed key-value store built from scratch in Python using `asyncio`, raw TCP framing for client traffic, and `gRPC` for internal node-to-node replication, failure detection, leader election, and cluster management.
+
+---
+
+## Features
+
+- **Custom RESP-like Protocol**: Hand-rolled, streaming TCP wire protocol parser (no third-party protocol libraries).
+- **In-Memory Store**: Supports `GET`, `SET`, `DEL`, `EXPIRE`, `EXISTS` with lazy TTL expiration.
+- **Pub/Sub Engine**: Channel-based async message broadcasting (`SUBSCRIBE`, `PUBLISH`).
+- **Primary-Replica Replication**: Supports both **Async (fire-and-forget)** and **Quorum** write modes.
+- **Heartbeat & Failure Detection**: Automatic health monitoring over gRPC with configurable failure thresholds.
+- **Leader Election**: Bully algorithm for automatic primary failover when the primary node dies.
+- **Split-Brain Protection**: Cluster majority monitoring and write-admission gates to prevent inconsistent state during network partitions.
+- **Consistent Hashing Sharding**: Client-side key routing across multiple primary nodes with 150 virtual nodes per physical node.
+- **Docker Compose Cluster**: Package multi-node topology into containerized setup.
+
+---
+
+## Quickstart with Docker Compose
+
+### 1. Build and Start Cluster
+
+Build image and launch 4-node cluster (1 Primary `node-a` + 3 Replicas `node-b`, `node-c`, `node-d`):
+
+```bash
+docker compose up --build -d
+```
+
+Verify running containers:
+
+```bash
+docker compose ps
+```
+
+---
+
+### 2. Connect CLI Client from Host Machine
+
+Connect the CLI client directly to the published primary port (`6380`):
+
+```bash
+python -m miniredis.cli_client --port 6380
+```
+
+Perform KV operations on the primary:
+
+```text
+mini-redis> SET demo:key "hello-from-docker"
+OK
+mini-redis> GET demo:key
+hello-from-docker
+```
+
+---
+
+### 3. Demo Primary Failure & Automatic Failover (FA-2 Centerpiece)
+
+#### Step A: Tail Logs to Watch Election Live
+Open a terminal window and stream logs from remaining replica nodes:
+
+```bash
+docker compose logs -f node-b node-c node-d
+```
+
+#### Step B: Simulate Primary Failure
+In a separate terminal, simulate node failure of the primary container `node-a`.
+
+- **Graceful Stop**:
+  ```bash
+  docker compose stop node-a
+  ```
+- **Hard Kill** (simulates abrupt crash / power loss, matching `Stop-Process -Force`):
+  ```bash
+  docker compose kill node-a
+  ```
+
+#### Step C: Observe Failover & Promotion
+In the log stream (`docker compose logs -f`), observe:
+1. Replicas detect missing heartbeats: `PRIMARY DECLARED DEAD`.
+2. Bully election algorithm triggers among surviving replicas.
+3. Highest priority node (e.g. `node-d`) wins election and promotes itself to `PRIMARY`.
+
+#### Step D: Verify Data Accessibility After Promotion
+Connect the CLI to the promoted node's published host port (e.g. `node-b` on `6381` or `node-d` on `6383`):
+
+```bash
+python -m miniredis.cli_client --port 6381
+```
+
+Confirm data persisted across failover:
+
+```text
+mini-redis> GET demo:key
+hello-from-docker
+```
+
+---
+
+### 4. Sharded Mode (Consistent Hashing)
+
+Connect client in sharded mode across all published node ports:
+
+```bash
+python -m miniredis.cli_client \
+  --shard node-a=127.0.0.1:6380 \
+  --shard node-b=127.0.0.1:6381 \
+  --shard node-c=127.0.0.1:6382 \
+  --shard node-d=127.0.0.1:6383
+```
+
+---
+
+### 5. Cluster Teardown
+
+Stop and remove containers, networks, and volumes:
+
+```bash
+docker compose down
+```
+
+---
+
+## Manual Multi-Node Startup (Without Docker)
+
+You can also run nodes locally in separate terminal windows:
+
+### 1. Start Replicas
+
+```bash
+# Terminal 1 (Replica 1)
+python -m miniredis.server --role replica --port 6381 --grpc-port 7381 --node-id node-b --primary-address 127.0.0.1:7380 --primary-node-id node-a --peer node-a,127.0.0.1:7380,127.0.0.1:6380
+
+# Terminal 2 (Replica 2)
+python -m miniredis.server --role replica --port 6382 --grpc-port 7382 --node-id node-c --primary-address 127.0.0.1:7380 --primary-node-id node-a --peer node-a,127.0.0.1:7380,127.0.0.1:6380
+```
+
+### 2. Start Primary
+
+```bash
+# Terminal 3 (Primary)
+python -m miniredis.server --role primary --port 6380 --grpc-port 7380 --node-id node-a --replica-of 127.0.0.1:7381 --replica-of 127.0.0.1:7382 --peer node-b,127.0.0.1:7381,127.0.0.1:6381 --peer node-c,127.0.0.1:7382,127.0.0.1:6382
+```
+
+---
+
+## Running Tests
+
+Run the full pytest suite (117 test cases):
+
+```bash
+python -m pytest tests/ -v
+```

@@ -10,17 +10,22 @@ service ElectionService {
 message ElectionMessage {
 	string sender_id = 1;
 	int64 sender_priority = 2;
+	uint64 lamport_timestamp = 3;
 }
 
 message ElectionAck {
 	bool acknowledged = 1;
+	uint64 lamport_timestamp = 2;
 }
 
 message CoordinatorMessage {
 	string new_primary_id = 1;
 	string new_primary_address = 2;
+	uint64 election_epoch = 3;
+	uint64 lamport_timestamp = 4;
 }
 
 message CoordinatorAck {
 	bool acknowledged = 1;
+	uint64 lamport_timestamp = 2;
 }

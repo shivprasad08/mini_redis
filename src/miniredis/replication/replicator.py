@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from typing import Callable, Literal, Optional
 
 import grpc
 
 from miniredis.cluster import WriteAdmissionGate, majority_count
+from miniredis.logical_clock import LamportClock, log_lamport_event
 from miniredis.storage import Store
 from miniredis.replication.proto import replication_pb2
 from miniredis.replication.proto import replication_pb2_grpc
@@ -37,45 +39,122 @@ logger = logging.getLogger(__name__)
 class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
     """gRPC Servicer for the replica role."""
 
-    def __init__(self, store: Store) -> None:
+    def __init__(
+        self,
+        store: Store,
+        node_id: str = "",
+        lamport_clock: Optional[LamportClock] = None,
+    ) -> None:
         self._store = store
+        self._current_epoch = 0
         self._applied_sequence = 0
+        self._node_id = node_id or "replica"
+        self._lamport_clock = lamport_clock or LamportClock()
 
     async def ReplicateWrite(
         self,
         request: replication_pb2.WriteOp,
         context: grpc.aio.ServicerContext,
     ) -> replication_pb2.Ack:
-        # Check sequence
+        logger.info(
+            f"[gRPC IN] ReplicateWrite received — op={request.op_type} "
+            f"key={request.key!r} seq={request.sequence} from peer={context.peer()}"
+        )
+        recv_ts = await self._lamport_clock.receive(request.lamport_timestamp)
+        log_lamport_event(
+            timestamp=recv_ts,
+            node_id=self._node_id,
+            event_type="replication_recv",
+            message_id=f"{request.epoch}:{request.sequence}",
+            description=f"received {request.op_type}",
+        )
+
+        if request.epoch < self._current_epoch:
+            logger.warning(
+                "Rejecting obsolete replication epoch %s; current epoch is %s",
+                request.epoch,
+                self._current_epoch,
+            )
+            return replication_pb2.Ack(
+                success=False,
+                applied_sequence=self._applied_sequence,
+                epoch=self._current_epoch,
+                lamport_timestamp=await self._lamport_clock.tick(),
+            )
+
+        if request.epoch > self._current_epoch:
+            # A coordinator announcement establishes the new epoch before
+            # writes arrive. Reset only the per-epoch sequence, never the epoch.
+            self._current_epoch = request.epoch
+            self._applied_sequence = 0
+
         if request.sequence <= self._applied_sequence:
             logger.warning(
-                f"Duplicate or out-of-order write detected. "
-                f"Got sequence {request.sequence}, but already at {self._applied_sequence}"
+                "Rejecting duplicate replication write: epoch=%s sequence=%s; "
+                "already applied through sequence %s",
+                request.epoch,
+                request.sequence,
+                self._applied_sequence,
             )
-        elif request.sequence > self._applied_sequence + 1:
+            return replication_pb2.Ack(
+                success=False,
+                applied_sequence=self._applied_sequence,
+                epoch=self._current_epoch,
+                lamport_timestamp=await self._lamport_clock.tick(),
+            )
+
+        if request.sequence != self._applied_sequence + 1:
             logger.warning(
-                f"Sequence gap detected. "
-                f"Got sequence {request.sequence}, expected {self._applied_sequence + 1}"
+                "Rejecting replication sequence gap: epoch=%s got=%s expected=%s",
+                request.epoch,
+                request.sequence,
+                self._applied_sequence + 1,
+            )
+            return replication_pb2.Ack(
+                success=False,
+                applied_sequence=self._applied_sequence,
+                epoch=self._current_epoch,
+                lamport_timestamp=await self._lamport_clock.tick(),
             )
 
         op_type = request.op_type.upper()
         key = request.key.encode("utf-8")
         
+        expires_at = request.expiry_deadline_ms / 1000.0 if request.expiry_deadline_ms > 0 else None
+
         if op_type == "SET":
             ttl = request.ttl_seconds if request.ttl_seconds > 0 else None
-            self._store.set(key, request.value, ttl_seconds=ttl)
+            self._store.set(key, request.value, ttl_seconds=ttl, expires_at=expires_at)
         elif op_type == "DEL":
             self._store.delete(key)
         elif op_type == "EXPIRE":
-            self._store.expire(key, request.ttl_seconds)
+            if expires_at is not None:
+                self._store.expire_at(key, expires_at)
+            else:
+                self._store.expire(key, request.ttl_seconds)
         else:
             logger.error(f"Unknown operation type received: {op_type}")
 
-        self._applied_sequence = max(self._applied_sequence, request.sequence)
+        self._applied_sequence = request.sequence
 
+        logger.info(
+            f"[gRPC OUT] Sending Ack — success=True epoch={self._current_epoch} "
+            f"applied_sequence={self._applied_sequence}"
+        )
+
+        ack_ts = await self._lamport_clock.tick()
+        log_lamport_event(
+            timestamp=ack_ts,
+            node_id=self._node_id,
+            event_type="replication_ack_send",
+            message_id=f"{self._current_epoch}:{self._applied_sequence}",
+            description="sent replication ack",
+        )
         return replication_pb2.Ack(
             success=True,
-            applied_sequence=self._applied_sequence
+            applied_sequence=self._applied_sequence,
+            epoch=self._current_epoch,
+            lamport_timestamp=ack_ts,
         )
 
 
@@ -88,22 +167,32 @@ class Replicator:
         total_cluster_size: int,
         write_mode: Literal["async", "quorum"] = "async",
         write_timeout_seconds: float = 2.0,
+        simulate_latency_ms: float = 0.0,
         write_gate: Optional[WriteAdmissionGate] = None,
         rpc_filter: Optional[Callable[[str, str], bool]] = None,
+        epoch: int = 0,
+        node_id: str = "",
+        lamport_clock: Optional[LamportClock] = None,
     ) -> None:
         """
         targets: list of "host:port" strings for replica gRPC servers.
         """
         if write_mode not in {"async", "quorum"}:
             raise ValueError(f"Unsupported write mode: {write_mode}")
+        if not math.isfinite(simulate_latency_ms) or simulate_latency_ms < 0:
+            raise ValueError("simulate_latency_ms must be a finite non-negative value")
 
         self._sequence = 0
+        self._epoch = epoch
         self._targets = targets
         self._total_cluster_size = total_cluster_size
         self._write_mode = write_mode
         self._write_timeout_seconds = write_timeout_seconds
+        self._simulate_latency_seconds = simulate_latency_ms / 1000.0
         self._write_gate = write_gate
         self._rpc_filter = rpc_filter
+        self._node_id = node_id or "primary"
+        self._lamport_clock = lamport_clock or LamportClock()
         self._channels: list[grpc.aio.Channel] = []
         self._stubs: list[replication_pb2_grpc.ReplicationServiceStub] = []
 
@@ -113,7 +202,12 @@ class Replicator:
             self._stubs.append(replication_pb2_grpc.ReplicationServiceStub(channel))
 
     async def propagate(
-        self, op_type: str, key: bytes, value: bytes = b"", ttl_seconds: int = 0
+        self,
+        op_type: str,
+        key: bytes,
+        value: bytes = b"",
+        ttl_seconds: int = 0,
+        expiry_deadline_ms: int = 0,
     ) -> None:
         """
         Increment sequence and push this write to all replicas.
@@ -123,7 +217,13 @@ class Replicator:
             return
 
         self._sequence += 1
-        req = self._build_write_op(op_type, key, value, ttl_seconds)
+        req = await self._build_write_op(op_type, key, value, ttl_seconds, expiry_deadline_ms)
+
+        logger.info(
+            f"[gRPC OUT] ReplicateWrite (async, fire-and-forget) — "
+            f"op={op_type} key={key.decode(errors='replace')!r} seq={self._sequence} "
+            f"→ {len(self._stubs)} replica(s): {self._targets}"
+        )
 
         for index, stub in enumerate(self._stubs):
             asyncio.create_task(
@@ -131,7 +231,12 @@ class Replicator:
             )
 
     async def propagate_quorum(
-        self, op_type: str, key: bytes, value: bytes = b"", ttl_seconds: int = 0
+        self,
+        op_type: str,
+        key: bytes,
+        value: bytes = b"",
+        ttl_seconds: int = 0,
+        expiry_deadline_ms: int = 0,
     ) -> bool:
         """Replicate a write and wait for a cluster majority.
 
@@ -153,7 +258,7 @@ class Replicator:
             return False
 
         self._sequence += 1
-        req = self._build_write_op(op_type, key, value, ttl_seconds)
+        req = await self._build_write_op(op_type, key, value, ttl_seconds, expiry_deadline_ms)
 
         if not self._stubs:
             return True
@@ -161,6 +266,12 @@ class Replicator:
         required_replica_acks = majority_count(self._total_cluster_size) - 1
         if required_replica_acks <= 0:
             return True
+
+        logger.info(
+            f"[gRPC OUT] ReplicateWrite (quorum) — op={op_type} "
+            f"key={key.decode(errors='replace')!r} seq={self._sequence} "
+            f"→ {len(self._stubs)} replica(s), need {required_replica_acks} ack(s) for majority"
+        )
 
         tasks = [
             asyncio.create_task(self._replica_ack(stub, req, self._targets[index]))
@@ -177,30 +288,37 @@ class Replicator:
                 completed += 1
 
                 if successes >= required_replica_acks:
-                    if self._write_gate is not None:
-                        self._write_gate.allow_writes()
                     quorum_reached = True
                     return True
 
                 remaining = len(tasks) - completed
                 if successes + remaining < required_replica_acks:
-                    if self._write_gate is not None:
-                        self._write_gate.block_writes("minority partition, refusing writes")
                     return False
 
             return successes >= required_replica_acks
         finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
             if not quorum_reached:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                if self._write_gate is not None:
-                    self._write_gate.block_writes("minority partition, refusing writes")
+                # With zero successful acknowledgements, no replica has
+                # evidence of this request. Releasing the reservation lets a
+                # retry after a fully blocked partition reuse the next
+                # contiguous sequence. Partial-ACK failures keep the sequence
+                # consumed; silently rewriting those would risk divergence.
+                if successes == 0 and self._sequence == req.sequence:
+                    self._sequence -= 1
 
     async def propagate_write(
-        self, op_type: str, key: bytes, value: bytes = b"", ttl_seconds: int = 0
+        self,
+        op_type: str,
+        key: bytes,
+        value: bytes = b"",
+        ttl_seconds: int = 0,
+        expiry_deadline_ms: int = 0,
     ) -> bool:
         """Dispatch the write path selected at construction time.
 
@@ -208,24 +326,36 @@ class Replicator:
         whether the primary is running in async or quorum mode.
         """
         if self._write_mode == "quorum":
-            return await self.propagate_quorum(op_type, key, value, ttl_seconds)
+            return await self.propagate_quorum(op_type, key, value, ttl_seconds, expiry_deadline_ms)
 
-        await self.propagate(op_type, key, value, ttl_seconds)
+        await self.propagate(op_type, key, value, ttl_seconds, expiry_deadline_ms)
         return True
 
-    def _build_write_op(
+    async def _build_write_op(
         self,
         op_type: str,
         key: bytes,
         value: bytes,
         ttl_seconds: int,
+        expiry_deadline_ms: int,
     ) -> replication_pb2.WriteOp:
+        ts = await self._lamport_clock.tick()
+        log_lamport_event(
+            timestamp=ts,
+            node_id=self._node_id,
+            event_type="replication_send",
+            message_id=f"{self._epoch}:{self._sequence}",
+            description=f"sent {op_type}",
+        )
         return replication_pb2.WriteOp(
             op_type=op_type,
             key=key.decode("utf-8", errors="replace"),
             value=value,
             ttl_seconds=ttl_seconds,
             sequence=self._sequence,
+            epoch=self._epoch,
+            lamport_timestamp=ts,
+            expiry_deadline_ms=expiry_deadline_ms,
         )
 
     async def _send_to_replica(
@@ -238,9 +368,10 @@ class Replicator:
             if self._rpc_filter is not None and not self._rpc_filter("ReplicateWrite", target):
                 raise ConnectionError("partitioned")
             ack = await asyncio.wait_for(
-                stub.ReplicateWrite(req), timeout=self._write_timeout_seconds
+                self._replicate_with_simulated_latency(stub, req),
+                timeout=self._write_timeout_seconds,
             )
-            logger.debug(f"Replica {target} acked sequence {ack.applied_sequence}")
+            logger.info(f"[gRPC IN] Ack received from {target} — seq={ack.applied_sequence}")
         except asyncio.TimeoutError:
             logger.warning(
                 f"Failed to replicate sequence {req.sequence} to {target}: timed out"
@@ -254,6 +385,16 @@ class Replicator:
                 f"Unexpected error replicating to {target}: {e}"
             )
 
+    async def _record_ack(self, ack: replication_pb2.Ack) -> None:
+        ts = await self._lamport_clock.receive(ack.lamport_timestamp)
+        log_lamport_event(
+            timestamp=ts,
+            node_id=self._node_id,
+            event_type="replication_ack_recv",
+            message_id=f"{ack.epoch}:{ack.applied_sequence}",
+            description="received replication ack",
+        )
+
     async def _replica_ack(
         self,
         stub: replication_pb2_grpc.ReplicationServiceStub,
@@ -264,7 +405,8 @@ class Replicator:
             if self._rpc_filter is not None and not self._rpc_filter("ReplicateWrite", target):
                 raise ConnectionError("partitioned")
             ack = await asyncio.wait_for(
-                stub.ReplicateWrite(req), timeout=self._write_timeout_seconds
+                self._replicate_with_simulated_latency(stub, req),
+                timeout=self._write_timeout_seconds,
             )
             logger.debug(f"Replica {target} acked sequence {ack.applied_sequence}")
             return bool(ack.success)
@@ -281,10 +423,21 @@ class Replicator:
 
         return False
 
+    async def _replicate_with_simulated_latency(
+        self,
+        stub: replication_pb2_grpc.ReplicationServiceStub,
+        req: replication_pb2.WriteOp,
+    ) -> replication_pb2.Ack:
+        if self._simulate_latency_seconds > 0:
+            await asyncio.sleep(self._simulate_latency_seconds)
+        ack = await stub.ReplicateWrite(req)
+        await self._record_ack(ack)
+        return ack
+
     async def aclose(self) -> None:
         """Close every replica channel this Replicator opened."""
         channels = list(self._channels)
         self._channels.clear()
         self._stubs.clear()
         if channels:
-            await asyncio.gather(*(channel.close() for channel in channels), return_exceptions=True)    
+            await asyncio.gather(*(channel.close() for channel in channels), return_exceptions=True)

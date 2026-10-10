@@ -10,6 +10,7 @@ python -m grpc_tools.protoc \
     --grpc_python_out=src \
     src/miniredis/election/proto/election.proto \
     src/miniredis/health/proto/health.proto \
-    src/miniredis/replication/proto/replication.proto
+    src/miniredis/replication/proto/replication.proto \
+    src/miniredis/time_sync/proto/time.proto
 
 echo "Done."
