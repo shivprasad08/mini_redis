@@ -7,6 +7,8 @@ service MutexService {
     rpc RequestReply (ReplyMessage) returns (ReplyAck);
     rpc ReleaseLock (ReleaseRequest) returns (ReleaseResponse);
     rpc GetLockStatus (LockStatusRequest) returns (LockStatusResponse);
+    // M19 edge-chasing deadlock detection (Chandy-Misra-Haas)
+    rpc Probe (ProbeMessage) returns (ProbeAck);
 }
 
 message LockRequest {
@@ -71,4 +73,18 @@ message LockStatusResponse {
     string current_holder = 3;
     string fencing_token = 4;
     uint64 lamport_timestamp = 5;
+}
+
+// M19: probe(initiator, sender -> receiver). path lists the nodes visited.
+message ProbeMessage {
+    string initiator_id = 1;
+    string probe_id = 2;
+    string sender_id = 3;
+    repeated string path = 4;
+    uint64 lamport_timestamp = 5;
+}
+
+message ProbeAck {
+    string status = 1;   // forwarded | not_blocked | duplicate | detected | dropped
+    uint64 lamport_timestamp = 2;
 }

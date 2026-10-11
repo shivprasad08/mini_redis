@@ -7,6 +7,7 @@ Mutex managers for M16:
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -40,6 +41,15 @@ class ResourceState:
     replies_needed: Set[str] = field(default_factory=set)
     deferred: list[DeferredRequest] = field(default_factory=list)
     waiter_event: Optional[asyncio.Event] = None
+    deadlock_cycle: Optional[list[str]] = None  # set when chosen as M19 victim
+
+
+class DeadlockError(RuntimeError):
+    """M19: this acquisition was aborted to break a distributed wait-for cycle."""
+
+    def __init__(self, cycle: list[str]) -> None:
+        super().__init__("deadlock detected: wait-for cycle " + " -> ".join(cycle))
+        self.cycle = cycle
 
 
 class BaseLockManager:
@@ -79,8 +89,14 @@ class RicartAgrawalaManager(BaseLockManager):
         epoch_provider: Optional[Callable[[], int]] = None,
         rpc_timeout_seconds: float = 2.0,
         rpc_filter: Optional[Callable[[str, str], bool]] = None,
+        probe_interval_seconds: float = 0.5,
     ) -> None:
         self._node_id = node_id
+        # M19 edge-chasing state
+        self._probe_interval = probe_interval_seconds
+        self._seen_probes: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self.deadlock_stats = {"probes_sent": 0, "probes_received": 0, "duplicates": 0,
+                               "detected": 0, "aborted": 0}
         self._peer_addresses = dict(peer_addresses)  # peer_id -> grpc_address
         self._lamport_clock = lamport_clock or LamportClock()
         self._epoch_provider = epoch_provider or (lambda: 0)
@@ -122,6 +138,94 @@ class RicartAgrawalaManager(BaseLockManager):
             "messages_sent": self._msg_sent,
             "messages_received": self._msg_recv,
         }
+
+    # -- M19: Chandy-Misra-Haas edge-chasing deadlock detection --------
+    #
+    # Process = node. Node P waits for Q while some resource is WANTED at P
+    # and the reply from Q is still missing (Q holds the resource, or wants it
+    # with higher priority, and deferred P). A blocked node periodically sends
+    # probe(initiator=P) to every node it waits for; a blocked receiver
+    # forwards it once (duplicates by (initiator, probe_id) are dropped) to
+    # the nodes it waits for; a non-blocked receiver drops it. Probes only
+    # travel along wait-for edges and each node forwards a probe id once, so
+    # every probe terminates. If the initiator receives its own probe while
+    # still blocked, the path is a cycle; the highest node id in the cycle is
+    # the victim and aborts its pending acquisitions (DeadlockError), so one
+    # node aborts per cycle. Lost probes (node/network failure) can only
+    # delay detection, never fabricate a cycle.
+
+    def waiting_for(self) -> set[str]:
+        """Nodes this node currently waits on (outgoing wait-for edges)."""
+        return {
+            p for r in self._resources.values() if r.state == LockState.WANTED for p in r.replies_needed
+        }
+
+    async def _probe_loop(self, res: ResourceState) -> None:
+        while res.state == LockState.WANTED and res.waiter_event is not None and not res.waiter_event.is_set():
+            await asyncio.sleep(self._probe_interval)
+            if res.state != LockState.WANTED:
+                return
+            probe_id = uuid.uuid4().hex
+            self._remember_probe(self._node_id, probe_id)
+            for target in sorted(self.waiting_for()):
+                asyncio.create_task(self._send_probe(target, self._node_id, probe_id, [self._node_id]))
+
+    def _remember_probe(self, initiator: str, probe_id: str) -> bool:
+        key = (initiator, probe_id)
+        if key in self._seen_probes:
+            return False
+        self._seen_probes[key] = None
+        while len(self._seen_probes) > 4096:  # bounded cleanup
+            self._seen_probes.popitem(last=False)
+        return True
+
+    async def _send_probe(self, target: str, initiator: str, probe_id: str, path: list[str]) -> None:
+        stub = self._stubs.get(target)
+        if stub is None:
+            return
+        if self._rpc_filter is not None and not self._rpc_filter("Probe", self._peer_addresses.get(target, "")):
+            return
+        try:
+            ts = await self._lamport_clock.tick()
+            self.deadlock_stats["probes_sent"] += 1
+            await asyncio.wait_for(
+                stub.Probe(mutex_pb2.ProbeMessage(initiator_id=initiator, probe_id=probe_id,
+                                                  sender_id=self._node_id, path=path, lamport_timestamp=ts)),
+                timeout=self._rpc_timeout_seconds,
+            )
+        except Exception as exc:  # lost probe: detection is retried next interval
+            logger.debug("[%s] probe to %s lost: %s", self._node_id, target, str(exc))
+
+    async def handle_probe(self, initiator: str, probe_id: str, sender: str, path: list[str]) -> str:
+        self.deadlock_stats["probes_received"] += 1
+        waits = self.waiting_for()
+        if initiator == self._node_id:
+            if not waits:
+                return "not_blocked"
+            cycle = path + [self._node_id]
+            self.deadlock_stats["detected"] += 1
+            logger.warning("[%s] deadlock detected: %s", self._node_id, " -> ".join(cycle))
+            if max(cycle) == self._node_id:
+                await self._abort_as_victim(cycle)
+            return "detected"
+        if not waits:
+            return "not_blocked"
+        if len(path) > len(self._peer_addresses) + 1:
+            return "dropped"
+        if not self._remember_probe(initiator, probe_id):
+            self.deadlock_stats["duplicates"] += 1
+            return "duplicate"
+        for target in sorted(waits):
+            asyncio.create_task(self._send_probe(target, initiator, probe_id, path + [self._node_id]))
+        return "forwarded"
+
+    async def _abort_as_victim(self, cycle: list[str]) -> None:
+        async with self._lock:
+            for res in self._resources.values():
+                if res.state == LockState.WANTED and res.replies_needed and res.waiter_event is not None:
+                    res.deadlock_cycle = cycle
+                    res.waiter_event.set()
+                    self.deadlock_stats["aborted"] += 1
 
     def _get_resource(self, resource_id: str) -> ResourceState:
         if resource_id not in self._resources:
@@ -266,6 +370,7 @@ class RicartAgrawalaManager(BaseLockManager):
             res.client_id = client_id
             res.replies_needed = set(peers)
             res.waiter_event = asyncio.Event()
+            res.deadlock_cycle = None
 
         # If no peers exist in cluster, acquire immediately!
         if not peers:
@@ -332,7 +437,9 @@ class RicartAgrawalaManager(BaseLockManager):
                 res.acquired_token = token
                 return token
 
-        # Wait for remaining deferred replies to arrive via RequestReply RPC
+        # Wait for remaining deferred replies to arrive via RequestReply RPC,
+        # probing for distributed deadlock meanwhile (M19).
+        prober = asyncio.create_task(self._probe_loop(res))
         try:
             await asyncio.wait_for(res.waiter_event.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
@@ -345,8 +452,14 @@ class RicartAgrawalaManager(BaseLockManager):
                 raise TimeoutError(
                     f"Timed out waiting for Ricart-Agrawala replies from {res.replies_needed}"
                 )
+        finally:
+            prober.cancel()
 
         async with self._lock:
+            if res.deadlock_cycle is not None:
+                cycle = res.deadlock_cycle
+                await self._cleanup_failed_acquisition(resource_id)
+                raise DeadlockError(cycle)
             self._counter += 1
             token = FencingToken(
                 epoch=self.epoch,

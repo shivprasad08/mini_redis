@@ -6,6 +6,7 @@ from miniredis.mutex.protocol import FencingToken, FencingWatermarkError, LockSt
 from miniredis.mutex.manager import (
     BaseLockManager,
     CentralizedLockManager,
+    DeadlockError,
     RicartAgrawalaManager,
 )
 from miniredis.mutex.service import MutexServicer
@@ -16,6 +17,7 @@ __all__ = [
     "LockState",
     "BaseLockManager",
     "CentralizedLockManager",
+    "DeadlockError",
     "RicartAgrawalaManager",
     "MutexServicer",
 ]

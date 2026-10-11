@@ -136,6 +136,27 @@ services:
       start_period: 2s
     restart: on-failure
 
+  # M25: HTTP gateway + dashboard (smart client to the three nodes).
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miniredis-gateway
+    entrypoint: ["python", "-m", "miniredis.gateway"]
+    command: >
+      --nodes node-a:6380,node-b:6380,node-c:6380
+      --host 0.0.0.0
+      --port 8080
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    networks:
+      - miniredis-net
+    depends_on:
+      - node-a
+      - node-b
+      - node-c
+    restart: on-failure
+
 networks:
   miniredis-net:
     driver: bridge

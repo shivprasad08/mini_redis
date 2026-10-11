@@ -358,6 +358,15 @@ class BullyElection(LeadershipMixin):
 
 	async def _declare_victory(self) -> None:
 		logger.info("[BULLY] Node %s WON the election", self._node_id)
+		if self._role == "primary":
+			# Already leading: reassert the current epoch. Minting a new one here
+			# would move followers to an epoch this primary never adopts
+			# (promote_self is a no-op for a primary), so no peer would see a
+			# confirmed primary and elections would repeat forever.
+			await self._broadcast_coordinator()
+			async with self._election_lock:
+				self._is_electing = False
+			return
 		# Priority is by node id, not by data: never announce leadership
 		# while a reachable peer holds newer state than this node.
 		if not await self._catch_up_before_leading():

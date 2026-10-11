@@ -207,6 +207,7 @@ class MiniRedisNode:
         )
         self.replica_servicer.attach_snapshot_manager(self.snapshots)
         self.dispatcher.set_snapshot_manager(self.snapshots)
+        self.dispatcher.set_status_provider(self._role_status)
 
         self._reconciler = LeadershipReconciler(
             election=election,
@@ -236,6 +237,21 @@ class MiniRedisNode:
                 ledger=self.ledger,
                 apply_guard=lambda: not self.snapshots.recording_active(),
             )
+
+    def _role_status(self) -> dict[str, Any]:
+        """ROLE command payload (M24 smart-client discovery, M25 /status)."""
+        assert self.election is not None
+        progress = self.progress.snapshot()
+        return {
+            "node_id": self.node_id,
+            "role": self.election.role,
+            "epoch": self.election.election_epoch,
+            "primary": self.election.current_primary_id or None,
+            "replication_epoch": progress.epoch,
+            "last_applied_sequence": progress.last_applied_sequence,
+            "gap_detected": progress.gap_detected,
+            "established": self.established,
+        }
 
     def _capture_snapshot_state(self) -> dict[str, Any]:
         """Local state for a Chandy-Lamport snapshot (called synchronously)."""

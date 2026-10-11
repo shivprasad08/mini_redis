@@ -190,3 +190,13 @@ class MutexServicer(mutex_pb2_grpc.MutexServiceServicer):
             fencing_token=status.get("fencing_token", ""),
             lamport_timestamp=resp_ts,
         )
+
+    async def Probe(self, request, context):  # M19 edge-chasing probe
+        del context
+        await self._lamport_clock.receive(request.lamport_timestamp)
+        status = "unsupported"
+        if isinstance(self._manager, RicartAgrawalaManager):
+            status = await self._manager.handle_probe(
+                request.initiator_id, request.probe_id, request.sender_id, list(request.path)
+            )
+        return mutex_pb2.ProbeAck(status=status, lamport_timestamp=await self._lamport_clock.tick())

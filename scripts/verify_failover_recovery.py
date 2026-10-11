@@ -89,7 +89,7 @@ class Cluster:
             # Isolation: own project (=> own network), own container names and host ports.
             override = Path(tempfile.mkdtemp(prefix="miniredis-verify-")) / "docker-compose.isolated.yml"
             override.write_text(
-                "services:\n" + "".join(f"  {n}:\n    container_name: {project}-{n}\n" for n in NODES),
+                "services:\n" + "".join(f"  {n}:\n    container_name: {project}-{n}\n" for n in (*NODES, "gateway")),
                 encoding="utf-8",
             )
             self.compose += ["-p", project, "-f", str(override)]
@@ -97,6 +97,7 @@ class Cluster:
                 NODE_A_PORT=str(ports["node-a"]),
                 NODE_B_PORT=str(ports["node-b"]),
                 NODE_C_PORT=str(ports["node-c"]),
+                GATEWAY_PORT=str(free_ports(1)[0]),
             )
 
     # ── docker ------------------------------------------------───────
@@ -290,6 +291,22 @@ def scenario(cluster: Cluster, up: bool) -> None:
 
     wait_for("all containers healthy", lambda: all(cluster.health().get(n) == "healthy" for n in NODES), 120)
     wait_for("node-a is the single primary", lambda: cluster.primaries() == ["node-a"], 60)
+    gateway_port = cluster.env.get("GATEWAY_PORT")
+    if gateway_port:  # M25 gateway (throwaway projects publish it on a free port)
+        import urllib.request
+
+        base = f"http://127.0.0.1:{gateway_port}"
+
+        def gateway_status():
+            with urllib.request.urlopen(base + "/status", timeout=3) as resp:
+                return json.loads(resp.read())
+
+        wait_for("gateway /status reports node-a as primary", lambda: gateway_status()["primary"] == "node-a", 60)
+        put = urllib.request.Request(base + "/kv/verify:http", data=b'{"value": "ok"}', method="PUT")
+        with urllib.request.urlopen(put, timeout=10) as resp:
+            expect(resp.status == 200, "gateway PUT /kv/verify:http -> 200")
+        with urllib.request.urlopen(base + "/kv/verify:http", timeout=10) as resp:
+            expect(json.loads(resp.read())["value"] == "ok", "gateway GET returns the stored value")
     wait_for("node-b and node-c follow node-a (IN_SYNC)", lambda: all_in_sync(cluster, "node-a", ("node-b", "node-c")), 30)
 
     expect(cluster.command("node-a", "SET", "verify:boot", "1") == "+OK", "write accepted by node-a")

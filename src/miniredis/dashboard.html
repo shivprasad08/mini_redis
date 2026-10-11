@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mini-redis Control Center</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --ink:#1c2230; --muted:#5b6475; --line:#dde1e7;
+          --accent:#1f5fbf; --ok:#17733f; --okbg:#e3f3e9; --bad:#a3231a; --badbg:#fbe4e1; --warnbg:#fff4d6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--card); border-bottom:1px solid var(--line); padding:.75rem 1.25rem;
+           display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; justify-content:space-between; }
+  header h1 { font-size:1.15rem; margin:0; }
+  nav { display:flex; flex-wrap:wrap; gap:.4rem; }
+  nav button, .btn { border:1px solid var(--line); background:var(--card); color:var(--ink); padding:.45rem .85rem;
+           border-radius:.4rem; font:inherit; cursor:pointer; }
+  nav button[aria-selected="true"] { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .btn.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .btn:disabled { opacity:.5; cursor:default; }
+  main { max-width:1100px; margin:0 auto; padding:1.25rem; }
+  section[hidden] { display:none; }
+  h2 { font-size:1.2rem; margin:.2rem 0 1rem; }
+  .muted { color:var(--muted); }
+  .banner { padding:.7rem 1rem; border-radius:.5rem; margin-bottom:1rem; background:var(--card); border:1px solid var(--line); }
+  .banner.bad { background:var(--badbg); border-color:#efb7b0; }
+  .grid { display:grid; gap:1rem; grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:.6rem; padding:1rem; }
+  .node.primary { border:2px solid var(--ok); }
+  .node.down { border:2px dashed var(--bad); }
+  .node h3 { margin:0 0 .4rem; font-size:1.1rem; display:flex; justify-content:space-between; gap:.5rem; }
+  .tag { font-size:.8rem; padding:.1rem .5rem; border-radius:.3rem; font-weight:600; white-space:nowrap; }
+  .tag.primary { background:var(--okbg); color:var(--ok); }
+  .tag.replica { background:#e8eef9; color:var(--accent); }
+  .tag.down { background:var(--badbg); color:var(--bad); }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:.15rem .8rem; margin:0; font-size:.95rem; }
+  dt { color:var(--muted); } dd { margin:0; word-break:break-all; }
+  label { display:block; font-size:.9rem; color:var(--muted); margin-bottom:.2rem; }
+  input { width:100%; padding:.5rem; border:1px solid var(--line); border-radius:.4rem; font:inherit; }
+  .row { display:flex; flex-wrap:wrap; gap:.6rem; align-items:end; }
+  .row > div { flex:1 1 180px; }
+  pre { background:#f0f2f5; padding:.75rem; border-radius:.4rem; overflow:auto; font-size:.85rem; max-height:22rem; margin:.5rem 0 0; }
+  .concept h3 { margin:0 0 .5rem; font-size:1.05rem; }
+  .concept p { margin:.3rem 0; font-size:.95rem; }
+  .concept b { color:var(--muted); font-weight:600; }
+  code { font-size:.85rem; background:#f0f2f5; padding:.05rem .3rem; border-radius:.25rem; }
+  .limit { background:var(--warnbg); padding:.3rem .5rem; border-radius:.3rem; }
+  .step { max-width:760px; }
+  .step .say { font-size:1.15rem; }
+  .stepnav { display:flex; justify-content:space-between; align-items:center; margin-top:1rem; gap:.5rem; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+  html, body { max-width:100%; overflow-x:hidden; }
+  @media (max-width:600px) { body { font-size:15px; } main { padding:.8rem; } nav { width:100%; } nav button { flex:1 1 auto; padding:.45rem .5rem; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>mini-redis Control Center</h1>
+  <nav role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true">Cluster</button>
+    <button role="tab" data-tab="kv">Key-Value</button>
+    <button role="tab" data-tab="concepts">Concepts</button>
+    <button role="tab" data-tab="present">Presentation</button>
+  </nav>
+</header>
+<main>
+
+<section id="overview">
+  <h2>Cluster overview <span class="muted" id="updated"></span></h2>
+  <div id="banner" class="banner">Loading cluster status…</div>
+  <div id="nodes" class="grid"></div>
+  <p class="muted" id="changes"></p>
+</section>
+
+<section id="kv" hidden>
+  <h2>Key-value playground</h2>
+  <div class="card">
+    <div class="row">
+      <div><label for="k">Key</label><input id="k" placeholder="e.g. course" value="course"></div>
+      <div><label for="v">Value</label><input id="v" placeholder="e.g. distributed-systems" value="distributed-systems"></div>
+      <div><label for="ttl">TTL seconds (optional)</label><input id="ttl" inputmode="numeric" placeholder="none"></div>
+    </div>
+    <p class="row" style="margin-top:.8rem">
+      <button class="btn primary" id="put">PUT</button>
+      <button class="btn" id="get">GET</button>
+    </p>
+    <div id="kvresult" class="muted">The write goes to the current primary via the smart client; it replicates to both replicas.</div>
+  </div>
+  <div class="grid" style="margin-top:1rem">
+    <div class="card">
+      <h3>M20 ledger check</h3>
+      <p class="muted">Runs <code>VERIFY</code> on every node: re-reads its hash-chained log from disk.</p>
+      <button class="btn" id="verify">Verify ledgers</button>
+      <div id="verifyout"></div>
+    </div>
+    <div class="card">
+      <h3>M17 global snapshot</h3>
+      <p class="muted">Runs a real Chandy–Lamport <code>SNAPSHOT</code> (records state, changes nothing).</p>
+      <button class="btn" id="snap">Take snapshot</button>
+      <div id="snapout"></div>
+    </div>
+  </div>
+</section>
+
+<section id="concepts" hidden>
+  <h2>Concept explorer</h2>
+  <p class="muted">Explanations only — live results are on the Cluster and Key-Value tabs. Tests named below are the executable proof.</p>
+  <div id="cards" class="grid"></div>
+</section>
+
+<section id="present" hidden>
+  <h2>Guided presentation</h2>
+  <div class="card step">
+    <div class="muted" id="stepcount"></div>
+    <h3 id="steptitle"></h3>
+    <p class="say" id="stepsay"></p>
+    <p><b>Observe:</b> <span id="stepobserve"></span></p>
+    <p><b>Module / code:</b> <span id="stepcode"></span></p>
+    <div id="stepaction"></div>
+    <div class="stepnav">
+      <button class="btn" id="back">Back</button>
+      <button class="btn primary" id="next">Next</button>
+    </div>
+  </div>
+</section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// ---------- tabs ----------
+function showTab(name) {
+  document.querySelectorAll("nav button").forEach(b => b.setAttribute("aria-selected", b.dataset.tab === name));
+  document.querySelectorAll("main > section").forEach(s => s.hidden = s.id !== name);
+}
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
+
+// ---------- A. cluster overview (real /status, every 2 s) ----------
+let lastPrimary, changes = [];
+async function refresh() {
+  let s;
+  try {
+    const r = await fetch("/status", {cache: "no-store"});
+    s = await r.json();
+  } catch (e) {
+    $("banner").className = "banner bad";
+    $("banner").textContent = "Gateway unreachable — is `python -m miniredis.gateway` (or the gateway container) running?";
+    return;
+  }
+  $("updated").textContent = "· updated " + new Date().toLocaleTimeString();
+  $("banner").className = "banner" + (s.available ? "" : " bad");
+  $("banner").innerHTML = s.available
+    ? `★ Primary: <b>${esc(s.primary)}</b> (election epoch ${esc(s.epoch)}) — writes go here and replicate to the others.`
+    : "No primary available — writes are refused until a majority elects a leader.";
+  if (s.primary !== lastPrimary) {
+    if (lastPrimary !== undefined) changes.unshift(`${new Date().toLocaleTimeString()}: primary ${lastPrimary ?? "none"} → ${s.primary ?? "none"}`);
+    lastPrimary = s.primary;
+    $("changes").innerHTML = changes.slice(0, 6).map(esc).join("<br>");
+  }
+  $("nodes").innerHTML = s.nodes.map(n => {
+    const role = !n.healthy ? "down" : n.role;
+    const label = !n.healthy ? "✖ DOWN" : n.role === "primary" ? "★ PRIMARY" : "REPLICA";
+    return `<div class="card node ${role}">
+      <h3>${esc(n.node_id ?? "unknown")} <span class="tag ${role}">${label}</span></h3>
+      <dl><dt>Address</dt><dd>${esc(n.address)}</dd>
+      ${n.healthy ? `<dt>Epoch</dt><dd>${esc(n.epoch)}</dd>
+      <dt>Applied seq</dt><dd>${esc(n.last_applied_sequence)}</dd>
+      <dt>Lag</dt><dd>${n.lag === null ? "n/a (different epoch)" : esc(n.lag) + " write(s)"}</dd>
+      <dt>Follows</dt><dd>${esc(n.primary ?? "—")}</dd>` : `<dt>Status</dt><dd class="bad">not answering ROLE</dd>`}</dl></div>`;
+  }).join("");
+}
+refresh(); setInterval(refresh, 2000);
+
+// ---------- B. key-value playground (real PUT/GET) ----------
+async function call(method, url, body) {
+  const t0 = performance.now();
+  const r = await fetch(url, {method, headers: body ? {"Content-Type": "application/json"} : {}, body});
+  const text = await r.text();
+  let data; try { data = JSON.parse(text); } catch { data = text; }
+  return {status: r.status, data, ms: Math.round(performance.now() - t0)};
+}
+function showResult(el, method, url, res) {
+  const cls = res.status < 300 ? "ok" : "bad";
+  el.innerHTML = `<p class="${cls}"><b>${method} ${esc(url)} → HTTP ${res.status}</b> (${res.ms} ms)</p><pre>${esc(JSON.stringify(res.data, null, 2))}</pre>`;
+}
+async function kv(method) {
+  const key = $("k").value.trim();
+  if (!key) { $("kvresult").innerHTML = '<p class="bad">Enter a key first.</p>'; return; }
+  const url = "/kv/" + encodeURIComponent(key);
+  let body;
+  if (method === "PUT") {
+    const payload = {value: $("v").value};
+    if ($("ttl").value.trim()) payload.ttl = Number($("ttl").value);
+    body = JSON.stringify(payload);
+  }
+  $("kvresult").textContent = "Working…";
+  try { showResult($("kvresult"), method, url, await call(method, url, body)); }
+  catch (e) { $("kvresult").innerHTML = '<p class="bad">Gateway unreachable.</p>'; }
+}
+$("put").onclick = () => kv("PUT");
+$("get").onclick = () => kv("GET");
+
+$("verify").onclick = async () => {
+  $("verifyout").textContent = "Verifying…";
+  try {
+    const r = await call("GET", "/verify");
+    $("verifyout").innerHTML = r.data.nodes.map(n => n.ok
+      ? `<p class="ok">✔ ${esc(n.address)}: ${n.records} records, head <code>${esc(n.head_hash.slice(0, 12))}</code></p>`
+      : `<p class="bad">✖ ${esc(n.address)}: ${esc(n.error)}</p>`).join("");
+  } catch (e) { $("verifyout").innerHTML = '<p class="bad">Gateway unreachable.</p>'; }
+};
+$("snap").onclick = async () => {
+  $("snapout").textContent = "Collecting markers from all nodes…";
+  try {
+    const r = await call("POST", "/snapshot");
+    if (r.status !== 200) { showResult($("snapout"), "POST", "/snapshot", r); return; }
+    const s = r.data;
+    $("snapout").innerHTML = `<p class="ok"><b>${esc(s.status)}</b> · ${esc(s.snapshot_id)}</p>
+      <p>${s.summary.channels_closed}/${s.summary.channels} channels closed · ${s.summary.in_flight_messages} in-flight message(s)</p>
+      <p>${Object.entries(s.nodes).map(([id, n]) => `${esc(id)}: seq ${n.last_applied_sequence}, ${n.key_count} keys`).join("<br>")}</p>`;
+  } catch (e) { $("snapout").innerHTML = '<p class="bad">Gateway unreachable.</p>'; }
+};
+
+// ---------- C. concept explorer (explanations; proof = named tests) ----------
+const concepts = [
+  ["M13 Lamport clocks", "Order events across nodes without a shared clock: every message carries a counter.",
+   "Each node keeps a LamportClock; tick on send, max(local, received)+1 on receive. Every gRPC message carries it.",
+   "src/miniredis/logical_clock.py · src/miniredis/timeline.py", "tests/test_lamport.py; timeline tool `miniredis-timeline` on node logs."],
+  ["M14 Clock synchronization", "Nodes' wall clocks drift; replicas correct theirs against the primary.",
+   "Cristian's algorithm: offset = server time − (send + receive)/2. TTL deadlines use the corrected clock.",
+   "src/miniredis/time_sync/clock.py · src/miniredis/time_sync/service.py", "tests/test_time_sync.py; start a node with --clock-skew-ms."],
+  ["M15 Progress tracking", "Know how far each replica has got and whether its history matches.",
+   "Per node: epoch, last applied sequence and a hash-chained history digest; STALENESS classifies replicas.",
+   "src/miniredis/replication/progress.py · src/miniredis/staleness.py", "Lag column on the Cluster tab; tests/test_staleness.py."],
+  ["M16 Mutual exclusion", "Only one client may hold a lock at a time, cluster-wide.",
+   "Ricart–Agrawala (request everyone, reply unless you have priority) or a centralized primary; fencing tokens reject stale holders.",
+   "src/miniredis/mutex/manager.py · src/miniredis/mutex/service.py", "LOCK / UNLOCK / FENCED_SET over RESP; tests/test_mutex_integration.py."],
+  ["M17 Global snapshot", "Capture a consistent picture of all nodes and the messages in flight.",
+   "Chandy–Lamport: markers on FIFO links (one ordered sender per peer); state recorded under the commit lock.",
+   "src/miniredis/snapshot.py · src/miniredis/links.py", "“Take snapshot” on the Key-Value tab (real); tests/test_snapshot.py."],
+  ["M18 Leader election", "When the primary dies, the survivors pick exactly one new leader.",
+   "Bully (highest id wins) or Chang–Roberts ring; majority required; epochs fence stale leaders.",
+   "src/miniredis/election/election.py · ring.py · leadership.py", "Stop the primary (docker compose stop) and watch the Cluster tab; tests/test_leader_recovery.py.",
+   "No leader leases: in an asymmetric partition an old primary can briefly overlap (different epoch)."],
+  ["M19 Deadlock detection", "Find circular waits between nodes holding and requesting locks.",
+   "Chandy–Misra–Haas edge chasing: blocked nodes forward probes along wait-for edges; a returning probe is a cycle; highest id aborts.",
+   "src/miniredis/mutex/manager.py (handle_probe)", "tests/test_deadlock.py (2- and 3-node cycles, lost probes).",
+   "Explanation only here — no UI action. Phantom deadlocks possible; centralized lock mode not covered."],
+  ["M20 Hash-chained ledger", "Writes survive restarts and tampering is detectable.",
+   "Write-ahead JSON-lines log; each record hashes the previous one; replayed on start; fsync always/batch/interval.",
+   "src/miniredis/ledger.py", "“Verify ledgers” on the Key-Value tab (real); tests/test_ledger.py, tests/test_persistence.py.",
+   "No compaction; a corrupted ledger stops the node (fail closed)."],
+  ["M21 Async vs quorum", "Trade latency for safety when acknowledging writes.",
+   "async: ack after local apply; quorum: ack after a majority applied. Optional simulated network latency.",
+   "src/miniredis/replication/replicator.py · src/miniredis/benchmark.py", "`miniredis-benchmark`; WRITE_MODE=quorum in .env; tests/test_benchmark.py."],
+  ["M24 Smart client", "Clients should not need to know which node is the leader.",
+   "Asks every node ROLE, routes to the primary, rediscovers on failure; never re-sends a write with unknown outcome.",
+   "src/miniredis/smart_client.py · scripts/smart_client_demo.py", "Run the demo, stop the primary: writes continue; tests/test_smart_client.py."],
+  ["M25 HTTP gateway", "A web front door to the cluster.",
+   "Asyncio HTTP server over the smart client: /kv/{key}, /status, /verify, /snapshot and this page.",
+   "src/miniredis/gateway.py · src/miniredis/dashboard.html", "This dashboard; tests/test_gateway.py."],
+];
+$("cards").innerHTML = concepts.map(([t, c, i, f, d, l]) => `<div class="card concept"><h3>${esc(t)}</h3>
+  <p><b>Concept:</b> ${esc(c)}</p><p><b>How:</b> ${esc(i)}</p><p><b>Code:</b> <code>${esc(f)}</code></p>
+  <p><b>Show:</b> ${esc(d)}</p>${l ? `<p class="limit"><b>Limitation:</b> ${esc(l)}</p>` : ""}</div>`).join("");
+
+// ---------- D. guided presentation ----------
+const steps = [
+  {t: "1 · Architecture", say: "Three nodes: one primary takes writes, two replicas copy them over gRPC. Clients reach the cluster through this HTTP gateway.",
+   see: "Three node cards, one marked ★ PRIMARY with an epoch number.", code: "M25 · src/miniredis/node.py, gateway.py", tab: "overview"},
+  {t: "2 · A real write and read", say: "I write a key through the gateway; the smart client sends it to the primary.",
+   see: "HTTP 200 for PUT, then GET returns the same value.", code: "M24/M25 · smart_client.py, gateway.py", tab: "kv"},
+  {t: "3 · Replication and consistency", say: "Every write gets an epoch and a sequence number and travels on an ordered link to each replica. Lag shows how far behind a replica is.",
+   see: "Applied seq rises on all three nodes; lag returns to 0.", code: "M15/M21 · replication/replicator.py, progress.py", tab: "overview"},
+  {t: "4 · Mutual exclusion and deadlock", say: "Locks use Ricart–Agrawala with fencing tokens. If nodes wait on each other in a cycle, probes travel along wait-for edges and the highest node aborts.",
+   see: "Run `python -m pytest -v tests/test_deadlock.py` — the cycle is detected and one victim aborts.", code: "M16/M19 · mutex/manager.py", tab: "concepts"},
+  {t: "5 · Election and failover", say: "Now I stop the primary. The replicas notice missing heartbeats, hold an election and the highest live node wins with a new epoch.",
+   see: "Run `docker compose stop <primary>` yourself (this page never stops nodes). Optionally `python scripts/smart_client_demo.py` keeps writing through the failover.",
+   code: "M18/M24 · election/election.py, smart_client.py", tab: "overview"},
+  {t: "6 · Dashboard follows the new leader", say: "The status refreshes every two seconds: the old primary is DOWN and a new node is ★ PRIMARY with a higher epoch.",
+   see: "The primary-change log under the node cards; a PUT on the Key-Value tab still succeeds.", code: "M25 · dashboard.html", tab: "overview"},
+  {t: "7 · Persistence and trade-offs", say: "Every write is appended to a hash-chained ledger before it is applied, so data survives restarts and tampering is detected. Async mode is faster; quorum mode never acknowledges a write a majority hasn't stored.",
+   see: "Click “Verify ledgers”: every node reports the same head hash.", code: "M20/M21 · ledger.py, replicator.py", tab: "kv"},
+];
+let step = 0;
+function render() {
+  const s = steps[step];
+  $("stepcount").textContent = `Step ${step + 1} of ${steps.length}`;
+  $("steptitle").textContent = s.t; $("stepsay").textContent = s.say;
+  $("stepobserve").textContent = s.see; $("stepcode").textContent = s.code;
+  $("stepaction").innerHTML = `<button class="btn" id="goto">Open the ${s.tab === "kv" ? "Key-Value" : s.tab === "concepts" ? "Concepts" : "Cluster"} tab</button>`;
+  $("goto").onclick = () => showTab(s.tab);
+  $("back").disabled = step === 0;
+  $("next").textContent = step === steps.length - 1 ? "Restart" : "Next";
+}
+$("back").onclick = () => { step = Math.max(0, step - 1); render(); };
+$("next").onclick = () => { step = (step + 1) % steps.length; render(); };
+render();
+</script>
+</body>
+</html>

@@ -20,6 +20,7 @@ Supported commands
 * ``SNAPSHOT``                 → bulk string (JSON Chandy–Lamport global snapshot) — M17
 * ``SNAPSHOT GET id``          → bulk string (JSON result of a recent snapshot) — M17
 * ``VERIFY``                   → bulk string (JSON ledger verification) or error — M20
+* ``ROLE``                     → bulk string (JSON role / epoch / primary / progress) — M24
 * anything else                → ``-ERR unknown command '<name>'``
 
 Commit path (M17/M20)
@@ -93,6 +94,7 @@ class Dispatcher:
         self._commit_lock = asyncio.Lock()
         self._ledger = None  # WriteLedger | None (M20)
         self._snapshot_manager = None  # SnapshotManager | None (M17)
+        self._status_provider = None  # Callable[[], dict] | None (M24 ROLE)
 
     def set_replicator(self, replicator: Optional[Replicator]) -> None:
         """Swap the replication backend at runtime."""
@@ -137,6 +139,10 @@ class Dispatcher:
 
     def set_snapshot_manager(self, manager) -> None:
         self._snapshot_manager = manager
+
+    def set_status_provider(self, provider) -> None:
+        """M24: callable returning this node's role/epoch/progress for ROLE."""
+        self._status_provider = provider
 
     # ── commit helpers ──────────────────────────────────────────────
 
@@ -234,6 +240,7 @@ class Dispatcher:
             "FENCED_SET": self._handle_fenced_set,
             "SNAPSHOT": self._handle_snapshot,
             "VERIFY": self._handle_verify,
+            "ROLE": self._handle_role,
         }
 
         handler = dispatch.get(command.name)
@@ -517,6 +524,17 @@ class Dispatcher:
                 return encode_error("ERR unknown snapshot id")
             return encode_bulk_string(json.dumps(result, indent=2).encode("utf-8"))
         return encode_error("ERR syntax error: SNAPSHOT [GET <snapshot-id>]")
+
+    def _handle_role(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """M24: JSON with this node's role, epoch, known primary and replication progress."""
+        if command.args:
+            return encode_error("ERR wrong number of arguments for 'ROLE' command")
+        if self._status_provider is not None:
+            status = self._status_provider()
+        else:
+            status = {"role": "primary" if self._writes_enabled else "replica"}
+        status["accepts_writes"] = self._writes_enabled and self._write_gate.can_serve_writes
+        return encode_bulk_string(json.dumps(status).encode("utf-8"))
 
     def _handle_verify(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
         """M20: re-read the persisted ledger from disk and verify its hash chain."""

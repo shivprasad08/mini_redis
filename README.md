@@ -767,6 +767,69 @@ mini-redis> VERIFY        # -ERR VERIFY FAILED: record 2: hash does not match re
 
 ---
 
+## M19 — Distributed Deadlock Detection (Edge Chasing)
+
+Implementation: `RicartAgrawalaManager` in [`src/miniredis/mutex/manager.py`](src/miniredis/mutex/manager.py) (`waiting_for`, `_probe_loop`, `handle_probe`, `DeadlockError`), `Probe` RPC in [`mutex.proto`](src/miniredis/mutex/proto/mutex.proto). Tests: [`tests/test_deadlock.py`](tests/test_deadlock.py).
+
+**Wait-for graph (distributed, never assembled anywhere).** A process is a node's lock client. Node P *waits for* Q while some resource is `WANTED` at P and Q's Ricart–Agrawala reply is still missing — Q deferred it because Q holds that resource (or wants it with higher priority). Each node only knows its own outgoing edges.
+
+**Chandy–Misra–Haas probes.** While blocked, a node sends `probe(initiator=self, probe_id)` every 0.5 s to every node it waits for. A receiver that is itself blocked forwards the probe once to every node *it* waits for, appending itself to `path`; a receiver that is not blocked drops it. Duplicates (same initiator + probe id) are dropped, paths longer than the cluster are dropped, and the seen-set is bounded (4096 entries), so every probe terminates. If a probe returns to its initiator while the initiator is still blocked, `path` is a cycle. The **highest node id in the cycle** is the victim: its pending acquisitions raise `DeadlockError` (`LOCK` replies `-ERR lock acquisition failed: deadlock detected: wait-for cycle node-b -> node-a -> node-b`), its `WANTED` state is cleaned up and deferred replies are flushed. The victim's client must then release the locks it holds; the others proceed. Only pending acquisitions are aborted, so held locks, mutual exclusion and fencing tokens are unaffected.
+
+**Failures.** A lost probe (dead node, partition) only delays detection: a cycle is reported only after a probe actually completed it, so failures cannot fabricate a deadlock; the lock timeout still bounds every wait. **Limitations (correctness):**
+- *Phantom deadlocks.* A probe reports edges as they were when it passed each node. If a wait ends (a reply arrives) while the probe is still travelling, a cycle that no longer exists can be reported and the victim's pending acquisition is aborted unnecessarily. This costs liveness for that one request (the client gets `DeadlockError` and may retry); it never violates mutual exclusion or fencing, because only a *pending* acquisition is aborted and held locks are untouched.
+- *Node granularity.* Wait-for edges are between nodes, not individual clients: two clients on the same node share one identity, and a victim aborts all of its node's pending acquisitions.
+- *Detection, not prevention.* Deadlock is resolved only after a probe completes the cycle (probe interval 0.5 s); if probes are lost, the lock timeout still bounds the wait.
+- *Centralized manager not covered.* With `--mutex-algo centralized` all lock state lives on the primary, so no probes are sent; a cycle there ends only by the lock timeout.
+
+## M24 — Smart Distributed Client
+
+Implementation: [`src/miniredis/smart_client.py`](src/miniredis/smart_client.py), discovery via the new `ROLE` command (JSON: `node_id`, `role`, `epoch`, `primary`, `last_applied_sequence`, `accepts_writes`). Tests: [`tests/test_smart_client.py`](tests/test_smart_client.py).
+
+The client asks every configured node for `ROLE`, routes all commands to the node that reports `role=primary` with writes enabled and the highest epoch, and caches it. On failure it rediscovers and retries up to `max_attempts` with exponential backoff:
+- **Reads** (`GET`) are retried after any failure.
+- **Writes** (`SET`/`DEL`) are retried only when they definitely did not apply: connection refused, or the server answered *not primary*, *minority partition*, `READONLY`, or *quorum not reached, write not applied*. If a write was sent but no reply arrived, the server has no request-id deduplication, so the client raises `UncertainWriteError` and does **not** re-send.
+
+Demo (writes continue across failover):
+```powershell
+docker compose up --build -d
+python scripts/smart_client_demo.py          # terminal 1
+docker compose stop node-a                   # terminal 2, while it runs
+```
+Writes pause for ~3–5 s during the election, then continue on `node-c`.
+
+## M25 — HTTP Gateway and Dashboard
+
+Implementation: [`src/miniredis/gateway.py`](src/miniredis/gateway.py) (asyncio only, no new dependency), built on the smart client; it never touches storage, replication or elections directly. Tests: [`tests/test_gateway.py`](tests/test_gateway.py).
+
+| Endpoint | Success | Errors |
+|---|---|---|
+| `GET /kv/{key}` | 200 `{"key","value"}` | 404 missing key, 400 invalid key, 503 no primary |
+| `PUT /kv/{key}` body `{"value": "<string>", "ttl": <optional positive int>}` | 200 `{"key","stored":true,"primary"}` | 400 invalid JSON/fields, 411 no Content-Length, 413 > 1 MiB, 503 no primary, 504 outcome unknown |
+| `GET /status` | 200 primary, epoch, per-node role / health / epoch / applied sequence / lag | 503 (same JSON) when no primary |
+| `GET /` | dashboard (refreshes `/status` every 2 s, logs primary changes, marks down nodes) | |
+
+Keys are URL-decoded, 1–512 printable characters, no `/`. Run it:
+```powershell
+docker compose up --build -d          # includes the gateway service on port 8080
+# or locally against any cluster:
+python -m miniredis.gateway --nodes 127.0.0.1:6380,127.0.0.1:6381,127.0.0.1:6382 --port 8080
+curl -X PUT http://127.0.0.1:8080/kv/hello -H "Content-Type: application/json" -d '{\"value\": \"world\"}'
+curl http://127.0.0.1:8080/kv/hello
+curl http://127.0.0.1:8080/status
+```
+### Control Center (dashboard)
+
+`docker compose up --build -d`, then open **http://127.0.0.1:8080/** (laptop, tablet or phone). The page is [`src/miniredis/dashboard.html`](src/miniredis/dashboard.html), plain HTML/CSS/JS served by the gateway; everything it shows comes from real endpoints:
+
+- **Cluster** — the three nodes from `/status` (refreshed every 2 s): role (★ PRIMARY / REPLICA / ✖ DOWN, not colour alone), epoch, applied sequence, lag, and a log of primary changes.
+- **Key-Value** — PUT / GET a key through `/kv/{key}`; **Verify ledgers** calls `GET /verify` (M20 `VERIFY` on every node); **Take snapshot** calls `POST /snapshot` (a real M17 Chandy–Lamport snapshot; read-only).
+- **Concepts** — one card per module (M13–M21, M24, M25): concept, mechanism, source files, what to demonstrate, limitations. Explanations only; the named tests are the executable proof.
+- **Presentation** — 7 guided steps with Back/Next: architecture → write/read → replication → mutual exclusion & deadlock (`python -m pytest -v tests/test_deadlock.py`) → failover → dashboard follows the new leader → persistence & async/quorum.
+
+The page never stops nodes or deletes data. For the failover step run `docker compose stop <current primary>` yourself (optionally with `python scripts/smart_client_demo.py` running); within a few seconds that node shows ✖ DOWN and another becomes ★ PRIMARY. `docker compose start <node>` brings it back as a replica. **Limitations:** one request per connection, no TLS or authentication, values are UTF-8 strings.
+
+---
+
 ## M23 — AWS Multi-AZ EC2 Deployment (Terraform)
 
 M23 automates the provisioning of a 3-node cluster across three Availability Zones in AWS using Terraform.
