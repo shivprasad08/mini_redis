@@ -33,6 +33,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 from typing import Awaitable, Callable, Optional
 
 from miniredis.dispatcher import Dispatcher, pubsub_message_framer
@@ -299,6 +300,37 @@ def main() -> None:
         default="bully",
         help="Distributed leader election algorithm: bully or ring (M18)",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="M20 ledger directory for this node (default: ./data/<node-id>); must not be shared between nodes",
+    )
+    parser.add_argument(
+        "--no-persistence",
+        action="store_true",
+        help="Disable the M20 ledger and keep data in memory only (pre-M20 behaviour)",
+    )
+    parser.add_argument(
+        "--fsync",
+        type=str,
+        choices=["always", "batch", "interval"],
+        default="always",
+        help="M20 durability policy: always (fsync before ack), batch (group fsync before ack), "
+        "interval (ack after OS write, background fsync)",
+    )
+    parser.add_argument(
+        "--fsync-interval-ms",
+        type=int,
+        default=None,
+        help="Group-commit window for 'batch' (default 2) or fsync period for 'interval' (default 1000)",
+    )
+    parser.add_argument(
+        "--snapshot-timeout-ms",
+        type=int,
+        default=5000,
+        help="M17 SNAPSHOT completion deadline",
+    )
     
     args = parser.parse_args()
 
@@ -336,6 +368,12 @@ def main() -> None:
                 clock_skew_ms=args.clock_skew_ms,
                 mutex_algo=args.mutex_algo,
                 election_algo=args.election_algo,
+                data_dir=None if args.no_persistence else (
+                    args.data_dir or os.path.join("data", args.node_id or f"{args.host}_{args.grpc_port}".replace(":", "_"))
+                ),
+                fsync_policy=args.fsync,
+                fsync_interval_ms=args.fsync_interval_ms,
+                snapshot_timeout_ms=args.snapshot_timeout_ms,
             )
         )
         await node.start()
@@ -344,10 +382,16 @@ def main() -> None:
         finally:
             await node.stop()
 
+    from miniredis.ledger import LedgerError
+
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         logger.info("Shutting down.")
+    except LedgerError as exc:
+        # Fail closed: never start writable on top of a ledger we cannot trust.
+        logger.critical("Refusing to start: ledger error: %s (file left untouched for investigation)", exc)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

@@ -212,11 +212,16 @@ class LeadershipMixin:
 
     _state_syncer: Optional[StateSyncer] = None
     _leadership_listener: Optional[Callable[[], None]] = None
+    _links: Optional[Any] = None  # LinkManager: FIFO links used by replicators (M17)
     _step_down_task: Optional["asyncio.Task[None]"] = None
 
     def attach_state_syncer(self, state_syncer: Optional[StateSyncer]) -> None:
         """Attach the coroutine used to pull a snapshot from another node."""
         self._state_syncer = state_syncer
+
+    def attach_links(self, links: Optional[Any]) -> None:
+        """Attach the node's FIFO links; replicators created on promotion use them."""
+        self._links = links
 
     def attach_leadership_listener(self, listener: Optional[Callable[[], None]]) -> None:
         """Attach a callback fired when a leadership conflict is observed."""

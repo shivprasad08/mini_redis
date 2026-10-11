@@ -15,7 +15,9 @@ For each election algorithm (bully and ring by default) the script:
      leadership in the same epoch, and replication to node-a resumes
   9. samples all three nodes continuously during failover and rejoin and
      fails if two nodes ever answer as primary at the same time
- 10. removes only the containers, network and images of that project
+ 10. takes a SNAPSHOT, VERIFYs every ledger, then stops and starts all three
+     containers and checks the data replays from the per-node volumes
+ 11. removes only the containers, network, volumes and images of that project
 
 A node counts as primary when it answers STALENESS: the command is refused
 on every node whose client writes are disabled. Sampling is periodic, so
@@ -341,6 +343,35 @@ def scenario(cluster: Cluster, up: bool) -> None:
     print("\nFinal STALENESS report from node-c:")
     print(json.dumps(report, indent=2))
 
+    # -- M17 / M20 ---------------------------------------------------
+    snapshot = json.loads(cluster.command("node-a", "SNAPSHOT"))
+    expect(
+        snapshot["status"] == "COMPLETED" and snapshot["summary"]["channels_closed"] == 6,
+        f"SNAPSHOT {snapshot['snapshot_id']} completed over 6 channels",
+    )
+    heads = set()
+    for node in NODES:
+        verified = json.loads(cluster.command(node, "VERIFY"))
+        expect(verified["ok"], f"VERIFY on {node}: {verified['records']} records, head {verified['head_hash'][:12]}")
+        heads.add(verified["head_hash"])
+    expect(len(heads) == 1, "all ledgers end at the same chain head")
+
+    cluster.docker("stop", *NODES)
+    cluster.docker("start", *NODES)
+    leader = wait_for(
+        "one primary after a full-cluster restart",
+        lambda: (p := cluster.primaries()) and len(p) == 1 and p,
+        90,
+    )[0]
+    wait_for(
+        "replayed data on every node",
+        lambda: all(cluster.command(n, "GET", "verify:resumed") == "yes" for n in NODES),
+        60,
+    )
+    expect(all(json.loads(cluster.command(n, "VERIFY"))["ok"] for n in NODES), "VERIFY ok on every node after restart")
+    expect(cluster.command(leader, "SET", "verify:after-restart", "1") == "+OK", f"{leader} accepts writes after restart")
+    wait_for("all containers healthy", lambda: all(cluster.health().get(n) == "healthy" for n in NODES), 60)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -391,8 +422,9 @@ def main() -> int:
             results[algo] = "FAIL"
         finally:
             if created and not args.keep:
-                # Only this project's containers, network and locally built images.
-                cluster.docker("down", "--remove-orphans", "--rmi", "local")
+                # Only this project's containers, network, ledger volumes and
+                # locally built images (all named after the throwaway project).
+                cluster.docker("down", "--remove-orphans", "--volumes", "--rmi", "local")
 
     print("\n======== summary ========")
     for algo, result in results.items():

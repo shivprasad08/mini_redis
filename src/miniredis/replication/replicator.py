@@ -41,13 +41,15 @@ Leadership fencing (safe rejoin):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
-from typing import Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 import grpc
 
 from miniredis.cluster import WriteAdmissionGate, majority_count
+from miniredis.ledger import LedgerWriteError
 from miniredis.peer_channel import open_peer_channel
 from miniredis.logical_clock import LamportClock, log_lamport_event
 from miniredis.replication.progress import ReplicationProgress
@@ -73,8 +75,13 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
         primary_id_provider: Optional[Callable[[], str]] = None,
         role_provider: Optional[Callable[[], str]] = None,
         on_newer_epoch: Optional[Callable[[int], object]] = None,
+        ledger: Optional[Any] = None,
+        link_guard: Optional[Any] = None,
     ) -> None:
         self._store = store
+        self._ledger = ledger  # WriteLedger | None (M20)
+        self._link_guard = link_guard  # LinkGuard | None (M17 FIFO links)
+        self._snapshot_manager: Optional[Any] = None  # SnapshotManager | None (M17)
         self._current_epoch = 0
         self._applied_sequence = 0
         self._node_id = node_id or "replica"
@@ -83,6 +90,9 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
         self._primary_id_provider = primary_id_provider
         self._role_provider = role_provider
         self._on_newer_epoch = on_newer_epoch
+
+    def attach_snapshot_manager(self, manager: Optional[Any]) -> None:
+        self._snapshot_manager = manager
 
     def reset_state(self, epoch: int, sequence: int) -> None:
         """Reset servicer epoch and sequence after catching up state."""
@@ -123,6 +133,18 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
             message_id=f"{request.epoch}:{request.sequence}",
             description=f"received {request.op_type}",
         )
+
+        if self._link_guard is not None and not self._link_guard.accept(
+            request.sender_id, request.link_incarnation, request.link_seq
+        ):
+            # Late delivery of a message its sender already gave up on: applying
+            # it now would break per-channel FIFO order.
+            return replication_pb2.Ack(
+                success=False,
+                applied_sequence=self._applied_sequence,
+                epoch=self._fence_epoch(),
+                lamport_timestamp=await self._lamport_clock.tick(),
+            )
 
         if self._role_provider is not None and self._role_provider() == "primary":
             # A primary's store is only mutated by its own client writes. Being
@@ -207,12 +229,36 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
 
         op_type = request.op_type.upper()
         key = request.key.encode("utf-8")
-        
+
         expires_at = request.expiry_deadline_ms / 1000.0 if request.expiry_deadline_ms > 0 else None
+        fencing_tok = getattr(request, "fencing_token", "")
+
+        record = None
+        if self._ledger is not None and op_type in ("SET", "DEL", "EXPIRE"):
+            # Write-ahead: persist before mutating the store, with no await in
+            # between, so the log and the store never disagree.
+            try:
+                record = self._ledger.append_op(
+                    epoch=request.epoch,
+                    seq=request.sequence,
+                    op=op_type,
+                    key=key,
+                    value=request.value,
+                    ttl_seconds=request.ttl_seconds,
+                    deadline_ms=request.expiry_deadline_ms,
+                    token=fencing_tok,
+                )
+            except LedgerWriteError as exc:
+                logger.error("Replica %s could not persist seq %s: %s", self._node_id, request.sequence, exc)
+                return replication_pb2.Ack(
+                    success=False,
+                    applied_sequence=self._applied_sequence,
+                    epoch=self._current_epoch,
+                    lamport_timestamp=await self._lamport_clock.tick(),
+                )
 
         if op_type == "SET":
             ttl = request.ttl_seconds if request.ttl_seconds > 0 else None
-            fencing_tok = getattr(request, "fencing_token", "")
             if fencing_tok:
                 try:
                     self._store.fenced_set(key, request.value, fencing_tok, ttl_seconds=ttl, expires_at=expires_at)
@@ -250,6 +296,37 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
                 ttl_seconds=request.ttl_seconds,
                 expiry_deadline_ms=request.expiry_deadline_ms,
             )
+
+        # M17: an applied message on channel sender -> this node, recorded in the
+        # same synchronous step as the apply.
+        if self._snapshot_manager is not None:
+            self._snapshot_manager.on_channel_message(
+                request.sender_id or "unknown",
+                {
+                    "type": "ReplicateWrite",
+                    "link_seq": request.link_seq,
+                    "epoch": request.epoch,
+                    "sequence": request.sequence,
+                    "op": op_type,
+                    "key": request.key,
+                    "value": request.value.decode("utf-8", errors="replace"),
+                    "deadline_ms": request.expiry_deadline_ms,
+                    "fencing_token": fencing_tok,
+                },
+            )
+
+        if record is not None:
+            # Acknowledge only once the configured durability rule is met.
+            try:
+                await self._ledger.wait_durable(record)
+            except LedgerWriteError as exc:
+                logger.error("Replica %s: seq %s applied but not durable: %s", self._node_id, request.sequence, exc)
+                return replication_pb2.Ack(
+                    success=False,
+                    applied_sequence=self._applied_sequence,
+                    epoch=self._current_epoch,
+                    lamport_timestamp=await self._lamport_clock.tick(),
+                )
 
         logger.info(
             f"[gRPC OUT] Sending Ack — success=True epoch={self._current_epoch} "
@@ -390,7 +467,71 @@ class ReplicaServicer(replication_pb2_grpc.ReplicationServiceServicer):
             lamport_timestamp=resp_ts,
             role=role,
             fencing_watermarks=watermarks,
+            ledger_head=self._ledger.head_hash if self._ledger is not None else "",
         )
+
+    # ── M17 Chandy-Lamport snapshot RPCs ─────────────────────────────
+
+    async def SnapshotMarker(
+        self,
+        request: replication_pb2.SnapshotMarkerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> replication_pb2.SnapshotMarkerAck:
+        del context
+        recv_ts = await self._lamport_clock.receive(request.lamport_timestamp)
+        log_lamport_event(
+            timestamp=recv_ts,
+            node_id=self._node_id,
+            event_type="snapshot_marker_recv",
+            message_id=f"{request.snapshot_id}:{request.sender_id}",
+            description="received snapshot marker",
+        )
+        if self._link_guard is not None and not self._link_guard.accept(
+            request.sender_id, request.link_incarnation, request.link_seq
+        ):
+            status = "out_of_order"
+        elif self._snapshot_manager is None:
+            status = "unsupported"
+        else:
+            status = await self._snapshot_manager.handle_marker(
+                request.snapshot_id, request.initiator_id, request.sender_id
+            )
+        return replication_pb2.SnapshotMarkerAck(status=status, lamport_timestamp=await self._lamport_clock.tick())
+
+    async def CollectSnapshot(
+        self,
+        request: replication_pb2.CollectSnapshotRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> replication_pb2.CollectSnapshotResponse:
+        del context
+        await self._lamport_clock.receive(request.lamport_timestamp)
+        if self._snapshot_manager is None:
+            report = {"node_id": self._node_id, "status": "UNSUPPORTED", "errors": ["snapshots not enabled"]}
+        else:
+            from miniredis.snapshot import valid_snapshot_id
+
+            if not valid_snapshot_id(request.snapshot_id):
+                report = {"node_id": self._node_id, "status": "INVALID", "errors": ["invalid snapshot id"]}
+            else:
+                report = await self._snapshot_manager.collect_local(request.snapshot_id, int(request.wait_ms))
+        return replication_pb2.CollectSnapshotResponse(
+            snapshot_id=request.snapshot_id,
+            node_id=self._node_id,
+            status=report["status"],
+            report_json=json.dumps(report),
+            lamport_timestamp=await self._lamport_clock.tick(),
+        )
+
+    async def ReleaseSnapshot(
+        self,
+        request: replication_pb2.ReleaseSnapshotRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> replication_pb2.ReleaseSnapshotAck:
+        del context
+        released = False
+        if self._snapshot_manager is not None:
+            released = self._snapshot_manager.release(request.snapshot_id)
+        return replication_pb2.ReleaseSnapshotAck(released=released)
 
 
 class Replicator:
@@ -411,12 +552,15 @@ class Replicator:
         progress: Optional[ReplicationProgress] = None,
         target_to_node_id: Optional[dict[str, str]] = None,
         on_higher_epoch: Optional[Callable[[int], object]] = None,
+        links: Optional[Any] = None,
     ) -> None:
         """
         targets: list of "host:port" strings for replica gRPC servers.
         progress: shared progress tracker for this node (primary side).
         on_higher_epoch: called when a replica rejects a write because it
             already follows a newer leadership epoch (this primary is stale).
+        links: LinkManager; writes to a target with a link are sent over that
+            ordered (FIFO) link instead of as independent concurrent RPCs.
         """
         if write_mode not in {"async", "quorum"}:
             raise ValueError(f"Unsupported write mode: {write_mode}")
@@ -444,6 +588,11 @@ class Replicator:
             channel = open_peer_channel(target)
             self._channels.append(channel)
             self._stubs.append(replication_pb2_grpc.ReplicationServiceStub(channel))
+        # Writes use the node's FIFO links when available; progress queries keep
+        # their own channels so they never wait behind queued writes.
+        self._links = {
+            target: links.for_address(target) for target in targets
+        } if links is not None else {}
 
     @property
     def target_to_node_id(self) -> dict[str, str]:
@@ -485,9 +634,13 @@ class Replicator:
         )
 
         for index, stub in enumerate(self._stubs):
-            asyncio.create_task(
-                self._send_to_replica(stub, req, self._targets[index])
-            )
+            target = self._targets[index]
+            if self._links.get(target) is not None:
+                # Enqueued synchronously: per-replica order == sequence order.
+                future = self._submit_via_link(target, req)
+                asyncio.create_task(self._await_link_ack(future, req, target))
+            else:
+                asyncio.create_task(self._send_to_replica(stub, req, target))
 
     async def propagate_quorum(
         self,
@@ -534,10 +687,14 @@ class Replicator:
             f"→ {len(self._stubs)} replica(s), need {required_replica_acks} ack(s) for majority"
         )
 
-        tasks = [
-            asyncio.create_task(self._replica_ack(stub, req, self._targets[index]))
-            for index, stub in enumerate(self._stubs)
-        ]
+        tasks = []
+        for index, stub in enumerate(self._stubs):
+            target = self._targets[index]
+            if self._links.get(target) is not None:
+                future = self._submit_via_link(target, req)
+                tasks.append(asyncio.create_task(self._link_replica_ack(future, req, target)))
+            else:
+                tasks.append(asyncio.create_task(self._replica_ack(stub, req, target)))
 
         successes = 0
         completed = 0
@@ -734,6 +891,39 @@ class Replicator:
                 f"Unexpected error replicating to {target}: {e}"
             )
 
+    def _submit_via_link(self, target: str, req: replication_pb2.WriteOp) -> "asyncio.Future[Any]":
+        copy = replication_pb2.WriteOp()
+        copy.CopyFrom(req)  # each link stamps its own sender/link_seq fields
+        return self._links[target].submit(
+            "ReplicateWrite",
+            copy,
+            timeout_seconds=self._write_timeout_seconds,
+            delay_seconds=self._simulate_latency_seconds,
+        )
+
+    async def _await_link_ack(self, future: "asyncio.Future[Any]", req: replication_pb2.WriteOp, target: str) -> None:
+        try:
+            ack = await future
+            await self._record_ack(ack)
+            logger.info(f"[gRPC IN] Ack received from {target} — seq={ack.applied_sequence}")
+            self._check_ack_epoch(ack, target)
+        except Exception as e:
+            logger.warning(f"Failed to replicate sequence {req.sequence} to {target}: {_describe_error(e)}")
+
+    async def _link_replica_ack(self, future: "asyncio.Future[Any]", req: replication_pb2.WriteOp, target: str) -> bool:
+        try:
+            # shield: abandoning the wait (quorum reached) must not withdraw the
+            # write from the link; it is still delivered in order.
+            ack = await asyncio.wait_for(asyncio.shield(future), timeout=self._write_timeout_seconds)
+            await self._record_ack(ack)
+            self._check_ack_epoch(ack, target)
+            return bool(ack.success)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Failed to replicate sequence {req.sequence} to {target}: {_describe_error(e)}")
+            return False
+
     def _check_ack_epoch(self, ack: replication_pb2.Ack, target: str) -> None:
         """Report a rejection proving that a newer leadership epoch exists."""
         if ack.success or ack.epoch <= self._epoch:
@@ -831,6 +1021,8 @@ async def sync_state_from_primary(
     timeout_seconds: float = 3.0,
     require_primary: bool = True,
     rpc_filter: Optional[Callable[[str, str], bool]] = None,
+    ledger: Optional[Any] = None,
+    apply_guard: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Pull a point-in-time snapshot from *primary_grpc_address* and adopt it.
 
@@ -892,19 +1084,41 @@ async def sync_state_from_primary(
             )
             return False
 
+    if apply_guard is not None and not apply_guard():
+        # e.g. a Chandy-Lamport snapshot is recording: installing a whole new
+        # state now would change state outside any recorded channel.
+        logger.info("Deferring snapshot install from %s", primary_grpc_address)
+        return False
+
+    items = [
+        (
+            item.key.encode("utf-8"),
+            item.value,
+            item.expiry_deadline_ms / 1000.0 if item.expiry_deadline_ms > 0 else None,
+        )
+        for item in resp.items
+    ]
+    watermarks = {key.encode("utf-8"): token for key, token in resp.fencing_watermarks.items()}
+    record = None
+    if ledger is not None:
+        # Write-ahead checkpoint: the persisted log must describe the state we
+        # are about to install, and continue the leader's chain (adopt).
+        try:
+            record = ledger.append_checkpoint(
+                epoch=resp.epoch,
+                seq=resp.sequence,
+                digest=resp.history_digest,
+                adopt_head=resp.ledger_head,
+                items=items,
+                watermarks=watermarks,
+            )
+        except LedgerWriteError as exc:
+            logger.error("Not installing snapshot from %s: %s", primary_grpc_address, exc)
+            return False
+
     # No await between replacing the keyspace and resetting progress, so a
     # concurrent ReplicateWrite never observes a half-restored node.
-    store.replace_all(
-        [
-            (
-                item.key.encode("utf-8"),
-                item.value,
-                item.expiry_deadline_ms / 1000.0 if item.expiry_deadline_ms > 0 else None,
-            )
-            for item in resp.items
-        ],
-        {key.encode("utf-8"): token for key, token in resp.fencing_watermarks.items()},
-    )
+    store.replace_all(items, watermarks)
     replica_servicer.reset_state(resp.epoch, resp.sequence)
     if progress is not None:
         progress.restore_from_snapshot(
@@ -913,6 +1127,12 @@ async def sync_state_from_primary(
             history_digest=resp.history_digest,
             role="replica",
         )
+    if record is not None:
+        try:
+            await ledger.wait_durable(record)
+        except LedgerWriteError as exc:
+            logger.error("Snapshot from %s installed but checkpoint not durable: %s", primary_grpc_address, exc)
+            return False
     logger.info(
         "Synchronized snapshot from %s (%s): epoch=%s, seq=%s, %d keys",
         primary_grpc_address,

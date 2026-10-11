@@ -17,7 +17,20 @@ Supported commands
 * ``SUBSCRIBE channel``        → array ``["subscribe", channel, count]``
 * ``PUBLISH channel message``  → integer (delivered count)
 * ``STALENESS``                → bulk string (JSON cluster report) — M15
+* ``SNAPSHOT``                 → bulk string (JSON Chandy–Lamport global snapshot) — M17
+* ``SNAPSHOT GET id``          → bulk string (JSON result of a recent snapshot) — M17
+* ``VERIFY``                   → bulk string (JSON ledger verification) or error — M20
 * anything else                → ``-ERR unknown command '<name>'``
+
+Commit path (M17/M20)
+─────────────────────
+Every mutating command runs its critical section under ``commit_lock``:
+authorization re-check → sequence allocation and send to replicas →
+write-ahead ledger append → store mutation → progress record. Holding the
+lock across these steps keeps local commits in sequence order (and records the
+sequence that was actually allocated), and lets a Chandy–Lamport recording
+take the lock to observe a state that matches exactly what was sent. The
+acknowledgement waits (outside the lock) for the ledger's durability rule.
 """
 
 from __future__ import annotations
@@ -40,6 +53,7 @@ from miniredis.protocol import (
 from miniredis.storage import Store
 from miniredis.pubsub import PubSub
 from miniredis.cluster import WriteAdmissionGate
+from miniredis.ledger import LedgerRecord, LedgerWriteError
 from miniredis.replication.replicator import Replicator
 
 
@@ -76,6 +90,9 @@ class Dispatcher:
         self._clock = clock
         self._progress = progress  # ReplicationProgress | None
         self._lock_manager = lock_manager
+        self._commit_lock = asyncio.Lock()
+        self._ledger = None  # WriteLedger | None (M20)
+        self._snapshot_manager = None  # SnapshotManager | None (M17)
 
     def set_replicator(self, replicator: Optional[Replicator]) -> None:
         """Swap the replication backend at runtime."""
@@ -110,6 +127,90 @@ class Dispatcher:
     def write_gate(self) -> WriteAdmissionGate:
         return self._write_gate
 
+    @property
+    def commit_lock(self) -> asyncio.Lock:
+        """Held while a write is sequenced, sent, logged and applied."""
+        return self._commit_lock
+
+    def set_ledger(self, ledger) -> None:
+        self._ledger = ledger
+
+    def set_snapshot_manager(self, manager) -> None:
+        self._snapshot_manager = manager
+
+    # ── commit helpers ──────────────────────────────────────────────
+
+    def _write_refusal(self) -> Optional[bytes]:
+        if not self._write_gate.can_serve_writes:
+            return encode_error("ERR minority partition, refusing writes")
+        if not self._writes_enabled:
+            return encode_error("ERR node is not primary")
+        return None
+
+    def _log_write(
+        self,
+        op: str,
+        key: bytes,
+        value: bytes = b"",
+        ttl_seconds: int = 0,
+        expiry_deadline_ms: int = 0,
+        fencing_token: str = "",
+    ) -> Optional[LedgerRecord]:
+        """Append the write about to be applied (raises LedgerWriteError)."""
+        if self._ledger is None:
+            return None
+        if self._replicator is not None:
+            epoch, seq = self._replicator.epoch, self._replicator.last_sequence()
+        else:
+            # No replicas: the ledger itself provides the per-epoch sequence.
+            epoch = self._progress.epoch if self._progress is not None else 0
+            seq = self._ledger.next_local_sequence(epoch)
+        return self._ledger.append_op(
+            epoch=epoch, seq=seq, op=op, key=key, value=value,
+            ttl_seconds=ttl_seconds, deadline_ms=expiry_deadline_ms, token=fencing_token,
+        )
+
+    def _record_progress(
+        self,
+        record: Optional[LedgerRecord],
+        op: str,
+        key: bytes,
+        value: bytes = b"",
+        ttl_seconds: int = 0,
+        expiry_deadline_ms: int = 0,
+    ) -> None:
+        if self._progress is None:
+            return
+        if self._replicator is not None:
+            self._replicator.record_primary_applied(
+                epoch=self._replicator.epoch,
+                sequence=self._replicator.last_sequence(),
+                op_type=op,
+                key=key,
+                value=value,
+                ttl_seconds=ttl_seconds,
+                expiry_deadline_ms=expiry_deadline_ms,
+            )
+        elif record is not None:
+            self._progress.record_applied(
+                epoch=record.epoch,
+                sequence=record.seq,
+                op_type=op,
+                key=key.decode("utf-8", errors="replace"),
+                value=value,
+                ttl_seconds=ttl_seconds,
+                expiry_deadline_ms=expiry_deadline_ms,
+            )
+
+    async def _acknowledge(self, record: Optional[LedgerRecord], reply: bytes) -> bytes:
+        """Return *reply* only once the ledger's durability rule is satisfied."""
+        if record is not None and self._ledger is not None:
+            try:
+                await self._ledger.wait_durable(record)
+            except LedgerWriteError as exc:
+                return encode_error(f"ERR write applied but not durable: {exc}")
+        return reply
+
     # ── public entry points ─────────────────────────────────────────
 
     async def handle_command(
@@ -131,6 +232,8 @@ class Dispatcher:
             "LOCK": self._handle_lock,
             "UNLOCK": self._handle_unlock,
             "FENCED_SET": self._handle_fenced_set,
+            "SNAPSHOT": self._handle_snapshot,
+            "VERIFY": self._handle_verify,
         }
 
         handler = dispatch.get(command.name)
@@ -161,12 +264,6 @@ class Dispatcher:
         if len(command.args) not in (2, 4):
             return encode_error("ERR wrong number of arguments for 'SET' command")
 
-        if not self._write_gate.can_serve_writes:
-            return encode_error("ERR minority partition, refusing writes")
-
-        if not self._writes_enabled:
-            return encode_error("ERR node is not primary")
-
         key = command.args[0]
         value = command.args[1]
         ttl: int | None = None
@@ -184,86 +281,77 @@ class Dispatcher:
             if ttl <= 0:
                 return encode_error("ERR invalid expire time in 'SET' command")
 
-        expiry_deadline_ms = (
-            int(self._clock() * 1000) + (ttl * 1000)
-            if ttl is not None and self._clock is not None
-            else 0
-        )
+        async with self._commit_lock:
+            # Re-checked under the lock: the node may have stepped down while
+            # this write waited for an earlier one.
+            refusal = self._write_refusal()
+            if refusal is not None:
+                return refusal
 
-        if self._replicator:
-            # Quorum mode is decided before the primary mutates local state so
-            # a failed quorum leaves the store unchanged and avoids rollback.
-            if not await self._replicator.propagate_write(
-                "SET",
-                key,
-                value,
-                ttl or 0,
-                expiry_deadline_ms=expiry_deadline_ms,
-            ):
-                return encode_error("ERR quorum not reached, write not applied")
-
-        self._store.set(
-            key,
-            value,
-            ttl_seconds=ttl,
-            expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
-        )
-
-        # Record the primary's local application in the progress tracker.
-        if self._replicator is not None and self._progress is not None:
-            self._replicator.record_primary_applied(
-                epoch=self._replicator.epoch,
-                sequence=self._replicator.last_sequence(),
-                op_type="SET",
-                key=key,
-                value=value,
-                ttl_seconds=ttl or 0,
-                expiry_deadline_ms=expiry_deadline_ms,
+            expiry_deadline_ms = (
+                int(self._clock() * 1000) + (ttl * 1000)
+                if ttl is not None and self._clock is not None
+                else 0
             )
 
-        return encode_simple_string("OK")
+            if self._replicator:
+                # Quorum mode is decided before the primary mutates local state so
+                # a failed quorum leaves the store unchanged and avoids rollback.
+                if not await self._replicator.propagate_write(
+                    "SET",
+                    key,
+                    value,
+                    ttl or 0,
+                    expiry_deadline_ms=expiry_deadline_ms,
+                ):
+                    return encode_error("ERR quorum not reached, write not applied")
+
+            try:
+                record = self._log_write("SET", key, value, ttl or 0, expiry_deadline_ms)
+            except LedgerWriteError as exc:
+                return encode_error(f"ERR write not persisted: {exc}")
+            self._store.set(
+                key,
+                value,
+                ttl_seconds=ttl,
+                expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
+            )
+            # Record the primary's local application in the progress tracker.
+            self._record_progress(record, "SET", key, value, ttl or 0, expiry_deadline_ms)
+
+        return await self._acknowledge(record, encode_simple_string("OK"))
 
     async def _handle_del(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
         if len(command.args) != 1:
             return encode_error("ERR wrong number of arguments for 'DEL' command")
 
-        if not self._write_gate.can_serve_writes:
-            return encode_error("ERR minority partition, refusing writes")
-
-        if not self._writes_enabled:
-            return encode_error("ERR node is not primary")
-
         key = command.args[0]
-        existed = self._store.exists(key)
+        record = None
+        async with self._commit_lock:
+            refusal = self._write_refusal()
+            if refusal is not None:
+                return refusal
 
-        if existed and self._replicator:
-            # The write is only committed locally after quorum succeeds.
-            if not await self._replicator.propagate_write("DEL", key):
-                return encode_error("ERR quorum not reached, write not applied")
+            existed = self._store.exists(key)
+            if existed and self._replicator:
+                # The write is only committed locally after quorum succeeds.
+                if not await self._replicator.propagate_write("DEL", key):
+                    return encode_error("ERR quorum not reached, write not applied")
 
-        count = self._store.delete(key) if existed else 0
+            if existed:
+                try:
+                    record = self._log_write("DEL", key)
+                except LedgerWriteError as exc:
+                    return encode_error(f"ERR write not persisted: {exc}")
+            count = self._store.delete(key) if existed else 0
+            if existed and count:
+                self._record_progress(record, "DEL", key)
 
-        # Record primary-side applied write.
-        if existed and count and self._replicator is not None and self._progress is not None:
-            self._replicator.record_primary_applied(
-                epoch=self._replicator.epoch,
-                sequence=self._replicator.last_sequence(),
-                op_type="DEL",
-                key=key,
-                value=b"",
-            )
-
-        return encode_integer(count)
+        return await self._acknowledge(record, encode_integer(count))
 
     async def _handle_expire(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
         if len(command.args) != 2:
             return encode_error("ERR wrong number of arguments for 'EXPIRE' command")
-
-        if not self._write_gate.can_serve_writes:
-            return encode_error("ERR minority partition, refusing writes")
-
-        if not self._writes_enabled:
-            return encode_error("ERR node is not primary")
 
         try:
             seconds = int(command.args[1])
@@ -273,43 +361,43 @@ class Dispatcher:
             return encode_error("ERR invalid expire time in 'EXPIRE' command")
 
         key = command.args[0]
-        existed = self._store.exists(key)
+        record = None
+        async with self._commit_lock:
+            refusal = self._write_refusal()
+            if refusal is not None:
+                return refusal
 
-        expiry_deadline_ms = (
-            int(self._clock() * 1000) + (seconds * 1000)
-            if self._clock is not None
-            else 0
-        )
-
-        if existed and self._replicator:
-            # Preserve the async-vs-quorum difference at the commit point.
-            if not await self._replicator.propagate_write(
-                "EXPIRE",
-                key,
-                ttl_seconds=seconds,
-                expiry_deadline_ms=expiry_deadline_ms,
-            ):
-                return encode_error("ERR quorum not reached, write not applied")
-
-        result = (
-            self._store.expire_at(key, expiry_deadline_ms / 1000.0)
-            if existed and expiry_deadline_ms
-            else self._store.expire(key, seconds) if existed else 0
-        )
-
-        # Record primary-side applied write.
-        if existed and result and self._replicator is not None and self._progress is not None:
-            self._replicator.record_primary_applied(
-                epoch=self._replicator.epoch,
-                sequence=self._replicator.last_sequence(),
-                op_type="EXPIRE",
-                key=key,
-                value=b"",
-                ttl_seconds=seconds,
-                expiry_deadline_ms=expiry_deadline_ms,
+            existed = self._store.exists(key)
+            expiry_deadline_ms = (
+                int(self._clock() * 1000) + (seconds * 1000)
+                if self._clock is not None
+                else 0
             )
 
-        return encode_integer(result)
+            if existed and self._replicator:
+                # Preserve the async-vs-quorum difference at the commit point.
+                if not await self._replicator.propagate_write(
+                    "EXPIRE",
+                    key,
+                    ttl_seconds=seconds,
+                    expiry_deadline_ms=expiry_deadline_ms,
+                ):
+                    return encode_error("ERR quorum not reached, write not applied")
+
+            if existed:
+                try:
+                    record = self._log_write("EXPIRE", key, b"", seconds, expiry_deadline_ms)
+                except LedgerWriteError as exc:
+                    return encode_error(f"ERR write not persisted: {exc}")
+            result = (
+                self._store.expire_at(key, expiry_deadline_ms / 1000.0)
+                if existed and expiry_deadline_ms
+                else self._store.expire(key, seconds) if existed else 0
+            )
+            if existed and result:
+                self._record_progress(record, "EXPIRE", key, b"", seconds, expiry_deadline_ms)
+
+        return await self._acknowledge(record, encode_integer(result))
 
     def _handle_exists(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
         if len(command.args) != 1:
@@ -407,6 +495,41 @@ class Dispatcher:
 
         return encode_bulk_string(json.dumps(report, indent=2).encode("utf-8"))
 
+    async def _handle_snapshot(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """M17: take (``SNAPSHOT``) or fetch (``SNAPSHOT GET id``) a global snapshot."""
+        if self._snapshot_manager is None:
+            return encode_error("ERR snapshots are not enabled on this node")
+        args = [a.decode("utf-8", errors="replace") for a in command.args]
+        if not args:
+            result = await self._snapshot_manager.initiate()
+            if result["status"] != "COMPLETED":
+                return encode_error(
+                    f"ERR SNAPSHOT {result.get('snapshot_id')} FAILED: {result.get('reason')}"
+                )
+            return encode_bulk_string(json.dumps(result, indent=2).encode("utf-8"))
+        if len(args) == 2 and args[0].upper() == "GET":
+            from miniredis.snapshot import valid_snapshot_id
+
+            if not valid_snapshot_id(args[1]):
+                return encode_error("ERR invalid snapshot id")
+            result = self._snapshot_manager.get_result(args[1])
+            if result is None:
+                return encode_error("ERR unknown snapshot id")
+            return encode_bulk_string(json.dumps(result, indent=2).encode("utf-8"))
+        return encode_error("ERR syntax error: SNAPSHOT [GET <snapshot-id>]")
+
+    def _handle_verify(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """M20: re-read the persisted ledger from disk and verify its hash chain."""
+        if command.args:
+            return encode_error("ERR wrong number of arguments for 'VERIFY' command")
+        if self._ledger is None:
+            return encode_error("ERR persistence is disabled on this node")
+        report = self._ledger.verify()
+        if not report.ok:
+            location = f"record {report.first_invalid_line}: " if report.first_invalid_line else ""
+            return encode_error(f"ERR VERIFY FAILED: {location}{report.error}")
+        return encode_bulk_string(json.dumps(report.as_dict(), indent=2).encode("utf-8"))
+
     async def _handle_lock(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
         """Acquire a distributed or centralized lock on a resource."""
         if len(command.args) != 1:
@@ -450,9 +573,6 @@ class Dispatcher:
         if len(command.args) not in (3, 5):
             return encode_error("ERR wrong number of arguments for 'FENCED_SET' command")
 
-        if not self._write_gate.can_serve_writes:
-            return encode_error(f"READONLY {self._write_gate.reason}")
-
         key = command.args[0]
         value = command.args[1]
         token_str = command.args[2].decode("utf-8", errors="replace")
@@ -476,50 +596,50 @@ class Dispatcher:
         except Exception:
             return encode_error("ERR invalid fencing token format")
 
-        # Validate against existing watermark before applying mutation
-        current_wm = self._store.get_watermark(key)
-        if current_wm is not None:
+        async with self._commit_lock:
+            if not self._write_gate.can_serve_writes:
+                return encode_error(f"READONLY {self._write_gate.reason}")
+
+            # Validate against existing watermark before applying mutation
+            current_wm = self._store.get_watermark(key)
+            if current_wm is not None:
+                try:
+                    current_parsed = FencingToken.from_str(current_wm)
+                    if token <= current_parsed:
+                        return encode_error(
+                            f"ERR stale fencing token {token} (current high-water mark is {current_parsed})"
+                        )
+                except Exception:
+                    pass
+
+            expiry_deadline_ms = 0
+            if ttl is not None and self._clock is not None:
+                expiry_deadline_ms = int((self._clock() + ttl) * 1000)
+
+            if self._replicator is not None:
+                quorum_ok = await self._replicator.propagate_write(
+                    "SET", key, value, ttl_seconds=ttl or 0, expiry_deadline_ms=expiry_deadline_ms, fencing_token=str(token)
+                )
+                if not quorum_ok:
+                    return encode_error(f"READONLY quorum write failed: {self._write_gate.reason}")
+
             try:
-                current_parsed = FencingToken.from_str(current_wm)
-                if token <= current_parsed:
-                    return encode_error(
-                        f"ERR stale fencing token {token} (current high-water mark is {current_parsed})"
-                    )
-            except Exception:
-                pass
+                record = self._log_write("SET", key, value, ttl or 0, expiry_deadline_ms, str(token))
+            except LedgerWriteError as exc:
+                return encode_error(f"ERR write not persisted: {exc}")
+            try:
+                self._store.fenced_set(
+                    key,
+                    value,
+                    token,
+                    ttl_seconds=ttl,
+                    expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
+                )
+            except FencingWatermarkError as exc:
+                # Logged and replicated: replay and replicas reach the same refusal.
+                return encode_error(f"ERR {exc}")
 
-        expiry_deadline_ms = 0
-        if ttl is not None and self._clock is not None:
-            expiry_deadline_ms = int((self._clock() + ttl) * 1000)
+            # Record primary applied write in progress tracker
+            self._record_progress(record, "SET", key, value, ttl or 0, expiry_deadline_ms)
 
-        if self._replicator is not None:
-            quorum_ok = await self._replicator.propagate_write(
-                "SET", key, value, ttl_seconds=ttl or 0, expiry_deadline_ms=expiry_deadline_ms, fencing_token=str(token)
-            )
-            if not quorum_ok:
-                return encode_error(f"READONLY quorum write failed: {self._write_gate.reason}")
-
-        try:
-            self._store.fenced_set(
-                key,
-                value,
-                token,
-                ttl_seconds=ttl,
-                expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
-            )
-        except FencingWatermarkError as exc:
-            return encode_error(f"ERR {exc}")
-
-        # Record primary applied write in progress tracker
-        if self._replicator is not None and self._progress is not None:
-            self._replicator.record_primary_applied(
-                epoch=self._replicator.epoch,
-                sequence=self._replicator.last_sequence(),
-                op_type="SET",
-                key=key,
-                value=value,
-                ttl_seconds=ttl or 0,
-                expiry_deadline_ms=expiry_deadline_ms,
-            )
-
-        return encode_simple_string("OK")
+        return await self._acknowledge(record, encode_simple_string("OK"))

@@ -524,6 +524,7 @@ class BullyElection(LeadershipMixin):
 				progress=self._progress,
 				target_to_node_id=target_to_node_id,
 				on_higher_epoch=self.observe_higher_epoch,
+				links=self._links,
 			)
 			if replica_targets
 			else None

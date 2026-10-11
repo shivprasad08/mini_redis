@@ -602,7 +602,7 @@ The Compose setup (`docker-compose.yml`) configures:
 - **Healthchecks**: Periodically checks socket connectivity with Redis `PING`.
 
 > [!NOTE]
-> Container recreation does not preserve data since M20 storage persistence is not part of this deployment scope.
+> Each node's M20 ledger lives on its own named volume, so data survives container recreation; `docker compose down -v` deletes it.
 
 ### Quick Start & Validation Commands
 
@@ -685,7 +685,7 @@ Fencing is epoch-based and reuses the existing write gate: replicas reject write
 **Why epochs are not persisted:** the data an epoch describes is in memory. A persisted epoch on a node whose store was wiped would make it look up to date. Instead a restarted node always relearns epoch *and* state from the cluster.
 
 **Limitations:**
-- **Full cluster restart loses all data** (no persistence; M20 is out of scope). The cluster simply bootstraps again.
+- **Full cluster restart:** with M20 persistence each node replays its ledger and an election picks a leader from the persisted state; with `--no-persistence` all data is lost and the cluster bootstraps again.
 - If a *majority* restarts at once while the only node holding data is unreachable, that majority can bootstrap a fresh cluster. When the old node reconnects, the higher-epoch side wins and the other side's writes are discarded — there is no merge.
 - **No leader leases.** In an asymmetric partition (e.g. only the `node-a`↔`node-c` link fails) the old primary keeps a majority through `node-b` while `node-c` is elected, so for up to about one reconciler interval (1 s) two nodes are write-authorized — always in *different* epochs, never the same one. The stale one fences itself on its first rejected write or the next leadership survey.
 - **`async` mode:** in that window, or before a deposed primary learns of the newer epoch, it can acknowledge client writes that are never replicated; they are discarded when it rejoins.
@@ -693,6 +693,77 @@ Fencing is epoch-based and reuses the existing write gate: replicas reject write
 - **Sustained write load:** asynchronous writes are sent as independent RPCs and can arrive out of order, so a rejoining replica may hit gaps and re-sync repeatedly; it is guaranteed to converge once writes pause, and `STALENESS` reports `LAGGING`/`DIVERGENT_GAP` until then.
 - Exactly one node must be configured `--role primary`. Two misconfigured bootstrap primaries starting together can both bootstrap; the higher epoch wins once their coordinator announcements cross.
 - Bully and Ring choose leaders by node id, not by data; the pre-leadership catch-up adopts the most advanced *reachable* peer's state.
+
+---
+
+## M17 — Chandy–Lamport Global Snapshot
+
+Implementation: [`src/miniredis/snapshot.py`](src/miniredis/snapshot.py) (algorithm, coordinator), [`src/miniredis/links.py`](src/miniredis/links.py) (FIFO channels), RPCs `SnapshotMarker` / `CollectSnapshot` / `ReleaseSnapshot` in [`replication.proto`](src/miniredis/replication/proto/replication.proto).
+
+**Channels.** Every ordered pair of nodes has one directed channel (3 nodes → 6 channels). Concurrent unary gRPC calls are *not* FIFO, so each node sends to each peer through one `PeerLink`: a single sender task that sends one RPC at a time and waits for its response (stop-and-wait), stamping `sender_id`, `link_incarnation` and an increasing `link_seq`. The receiver's `LinkGuard` rejects any message whose `link_seq` is not newer than the last one accepted from that sender (e.g. a late delivery of a request the sender gave up on). `ReplicateWrite` and markers share the link, so a marker always arrives after every write sent before it.
+
+**Algorithm.** The initiator records its local state and enqueues a marker on every outgoing link. A node receiving its first marker records its state (that channel's state is empty), sends markers and starts recording all other incoming channels; a later marker on a channel stops recording it. Recording and marker enqueueing happen in one synchronous step under the node's *commit lock* — the lock the primary holds while it sequences, sends, logs and applies a write — so the recorded state matches exactly what was sent. A node's part is complete when markers arrived on all incoming channels; the coordinator then collects every node's report.
+
+**Recorded state per node:** keys (value + absolute expiry), role, election epoch, replication epoch / last applied sequence / history digest, ledger head, Lamport time. **Channel state:** the `ReplicateWrite` messages applied after the receiver recorded and before that channel's marker.
+
+**Result.** `COMPLETED` only if every node completed, all n·(n-1) channels received their marker, and all nodes recorded the same leadership epoch (election traffic is not a recorded channel, so a leadership change mid-snapshot gives `FAILED`). Snapshot installs on recovering replicas are deferred while a snapshot is recording.
+
+| Case | Behaviour |
+|---|---|
+| Duplicate marker on a channel | Ignored (`duplicate`), counted in `duplicate_markers`; state is recorded once per id |
+| Concurrent `SNAPSHOT`s | Independent (different ids), at most 4 active per node |
+| Invalid / unknown id | `-ERR invalid snapshot id` / `-ERR unknown snapshot id` |
+| Node down (marker undeliverable) | Fails fast: `-ERR SNAPSHOT <id> FAILED: ...` |
+| Lost marker | `FAILED` after `--snapshot-timeout-ms` (default 5000), naming the missing channel |
+| Cleanup | Coordinator releases every node's state; late markers for released ids are ignored; stale state is garbage-collected |
+
+**Demo** (3-node cluster, e.g. Docker Compose):
+```bash
+python -m miniredis.cli_client --port 6380
+mini-redis> SET a 1
+mini-redis> SNAPSHOT
+# JSON: snapshot_id, status COMPLETED, participants, per-node epoch/last_applied_sequence/keys,
+# 6 channels each with marker_received=true and its in-flight messages
+mini-redis> SNAPSHOT GET snap-node-a-<id>
+```
+A consistent cut means: for every replica, *recorded state + messages on primary→replica* equals the primary's recorded state, and no replica holds a write the primary had not sent. `tests/test_snapshot.py` checks exactly this, including with in-flight writes (slow primary link, snapshot started on a replica) and with a concurrent writer.
+
+## M20 — Persistent Hash-Chained Write Log
+
+Implementation: [`src/miniredis/ledger.py`](src/miniredis/ledger.py) (format, chain, fsync policies, replay, verification), commit path in [`dispatcher.py`](src/miniredis/dispatcher.py), replica path and snapshot installs in [`replicator.py`](src/miniredis/replication/replicator.py), startup replay in [`node.py`](src/miniredis/node.py).
+
+**Record** (one JSON line, `<data-dir>/ledger.jsonl`): `v`, `kind` (`op` | `checkpoint`), `epoch`, `seq`, `op` (`SET`/`DEL`/`EXPIRE`), base64 `key`/`value`, `ttl`, absolute `deadline_ms`, fencing `token`, `prev`, `hash`. `hash = sha256(canonical JSON without "hash")`; the first record links to the fixed genesis hash `sha256("miniredis-ledger:v1:genesis")`. No node-specific field is hashed, so replicas applying the same writes build byte-identical `op` records and the same chain head. A replica that catches up by snapshot appends a `checkpoint` (full state) that *adopts* the leader's chain head, so later hashes match the leader's.
+
+**Write path.** Primary: under the commit lock, the write is replicated (async or quorum), appended (write-ahead), applied, recorded in progress; the client ack waits for the durability rule. Replica: appended and applied in one synchronous step after the epoch/sequence checks (duplicates and gaps are rejected before logging, so a retried RPC is never logged twice); the replication ack waits for durability. Replay never appends.
+
+| `--fsync` | Written | fsync | Ack returned | Lost on process crash | Lost on OS crash / power loss |
+|---|---|---|---|---|---|
+| `always` (default) | in the append | in the append | after fsync | nothing acknowledged | nothing acknowledged |
+| `batch` | in the append | group fsync every `--fsync-interval-ms` (2) | after the fsync covering it | nothing acknowledged | nothing acknowledged |
+| `interval` | in the append (flushed to OS) | background, every `--fsync-interval-ms` (1000) | immediately | nothing acknowledged | up to one interval of acknowledged writes |
+
+**Startup.** The ledger is locked (one process per directory), validated record by record (hash, `prev` link, version, epoch/sequence order) and replayed; absolute deadlines mean an expired key stays expired. An incomplete last line (interrupted append) is moved to `ledger.jsonl.torn-<ms>` and truncated. Any invalid *complete* record makes the node exit with code 2 and leave the file untouched (fail closed). After replay the node still joins through leader discovery; with all nodes restarted, an election picks a leader from the persisted state.
+
+**Storage.** Local runs default to `./data/<node-id>` (gitignored); `--data-dir` overrides, `--no-persistence` disables. Docker Compose mounts one named volume per node (`node-a-data`, `node-b-data`, `node-c-data` → `/data`). On AWS the service's working directory is `/opt/mini_redis`, so ledgers live in `/opt/mini_redis/data/<node-id>` on the instance's root volume (survives service restarts and instance stop/start). `user_data.sh` was deliberately not changed, to avoid Terraform drift on the running instances.
+
+**Verify, tamper and replay demo** (temporary directory, never real data):
+```powershell
+python -m miniredis.server --node-id demo --port 7390 --grpc-port 7391 --data-dir $env:TEMP\mr-demo
+# second terminal
+python -m miniredis.cli_client --port 7390
+mini-redis> SET a 1
+mini-redis> SET b 2 EX 30
+mini-redis> DEL a
+mini-redis> VERIFY        # {"ok": true, "records": 3, "last_sequence": 3, "head_hash": ...}
+# stop the server (Ctrl+C), start it again with the same command:
+mini-redis> GET b         # "2" (replayed; TTL deadline unchanged)
+mini-redis> GET a         # (nil)
+# tamper: edit a value field in $env:TEMP\mr-demo\ledger.jsonl, then
+mini-redis> VERIFY        # -ERR VERIFY FAILED: record 2: hash does not match record content (modified record)
+# restarting now exits with code 2: "Refusing to start: ledger error ..."
+```
+
+**Limitations.** Under `always`/`batch`, a write whose fsync failed is reported as failed but may still be on disk and replayed (indeterminate outcome, as with any WAL); the ledger then refuses all further writes. Ledgers grow without compaction. `VERIFY` reads the whole file. A node that recovered by snapshot keeps the checkpoint, not the individual earlier records. FIFO links send one RPC at a time per peer, which lowers replication throughput under high write rates.
 
 ---
 

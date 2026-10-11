@@ -35,3 +35,6 @@ infra/aws/terraform.tfvars.json
 
 # Terraform plan file without extension
 tfplan
+
+# M20 runtime ledgers (local runs default to ./data/<node-id>)
+data/

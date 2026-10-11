@@ -5,6 +5,10 @@ service ReplicationService {
   rpc ReplicateWrite (WriteOp) returns (Ack);
   rpc GetProgress (ProgressRequest) returns (ProgressResponse);
   rpc SyncSnapshot (SyncSnapshotRequest) returns (SyncSnapshotResponse);
+  // M17 Chandy-Lamport global snapshot
+  rpc SnapshotMarker (SnapshotMarkerRequest) returns (SnapshotMarkerAck);
+  rpc CollectSnapshot (CollectSnapshotRequest) returns (CollectSnapshotResponse);
+  rpc ReleaseSnapshot (ReleaseSnapshotRequest) returns (ReleaseSnapshotAck);
 }
 
 message WriteOp {
@@ -17,6 +21,10 @@ message WriteOp {
   uint64 lamport_timestamp = 7;
   int64 expiry_deadline_ms = 8; // 0 if no TTL; corrected-clock absolute deadline
   string fencing_token = 9;      // M16: optional fencing token for protected writes
+  // M17 FIFO link stamp (0/empty when sent outside a link)
+  string sender_id = 10;
+  uint64 link_seq = 11;
+  string link_incarnation = 12;
 }
 
 message Ack {
@@ -68,4 +76,46 @@ message SyncSnapshotResponse {
   uint64 lamport_timestamp = 6;
   string role = 7;                            // serving node's role; only a primary snapshot is authoritative
   map<string, string> fencing_watermarks = 8; // M16 fencing high-water marks, key -> token
+  string ledger_head = 9;                     // M20 chain head at the snapshot point ("" if not persisted)
+}
+
+// M17 Chandy-Lamport snapshot messages. Markers travel on the same FIFO link as
+// ReplicateWrite and carry the same link stamp.
+
+message SnapshotMarkerRequest {
+  string snapshot_id = 1;
+  string initiator_id = 2;
+  string sender_id = 3;
+  uint64 link_seq = 4;
+  string link_incarnation = 5;
+  uint64 lamport_timestamp = 6;
+}
+
+message SnapshotMarkerAck {
+  string status = 1;   // recorded | closed | duplicate | stale | busy | invalid_id | unknown_sender | out_of_order | unsupported
+  uint64 lamport_timestamp = 2;
+}
+
+message CollectSnapshotRequest {
+  string snapshot_id = 1;
+  int64 wait_ms = 2;
+  string requester_id = 3;
+  uint64 lamport_timestamp = 4;
+}
+
+message CollectSnapshotResponse {
+  string snapshot_id = 1;
+  string node_id = 2;
+  string status = 3;
+  string report_json = 4;   // recorded state + incoming channel states (JSON)
+  uint64 lamport_timestamp = 5;
+}
+
+message ReleaseSnapshotRequest {
+  string snapshot_id = 1;
+  string requester_id = 2;
+}
+
+message ReleaseSnapshotAck {
+  bool released = 1;
 }

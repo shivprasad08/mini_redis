@@ -105,3 +105,19 @@ def test_terraform_least_privilege_security_groups():
     # Subnets mapped across 3 distinct AZs
     assert "data.aws_availability_zones.available.names" in main_tf
     assert "count                   = 3" in main_tf
+
+
+def test_docker_compose_persists_each_node_ledger_separately():
+    """M20: every node has its own named volume for its ledger; none is shared."""
+    root = Path(__file__).parent.parent
+    content = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    mounts = re.findall(r"-\s+(node-[abc]-data):/data", content)
+    assert sorted(mounts) == ["node-a-data", "node-b-data", "node-c-data"]
+    assert content.count("--data-dir /data") == 3
+    assert content.count("--fsync ${FSYNC_POLICY:-always}") == 3
+    for volume in ("node-a-data:", "node-b-data:", "node-c-data:"):
+        assert f"  {volume}" in content.split("\nvolumes:\n", 1)[1]
+
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8")
+    assert "data/" in gitignore.splitlines()
+    assert "data/" in (root / ".dockerignore").read_text(encoding="utf-8").splitlines()

@@ -41,3 +41,6 @@ docs/
 src/miniredis/**/*_pb2.py
 src/miniredis/**/*_pb2.pyi
 src/miniredis/**/*_pb2_grpc.py
+
+# M20 runtime ledgers
+data/

@@ -16,6 +16,11 @@ Startup lifecycle
    snapshot), bootstraps a brand-new cluster (configured primary + majority
    reachable + no established epoch anywhere), or waits.
 4. The reconciler then keeps re-confirming leadership in the background.
+
+With ``data_dir`` set (M20), the node first opens and verifies its ledger and
+replays it into the store and progress tracker — before any server starts —
+so the state it advertises to peers is the recovered one. A corrupted ledger
+raises ``LedgerCorruptionError`` and the node does not start.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import grpc
 
@@ -35,6 +40,8 @@ from miniredis.election.proto import election_pb2_grpc
 from miniredis.election.ring import RingElection
 from miniredis.health.heartbeat import FailureDetector, HealthServicer
 from miniredis.health.proto import health_pb2_grpc
+from miniredis.ledger import WriteLedger, replay
+from miniredis.links import LinkGuard, LinkManager
 from miniredis.logical_clock import LamportClock
 from miniredis.mutex import CentralizedLockManager, MutexServicer, RicartAgrawalaManager
 from miniredis.mutex.proto import mutex_pb2_grpc
@@ -42,6 +49,7 @@ from miniredis.pubsub import PubSub
 from miniredis.replication.progress import ReplicationProgress
 from miniredis.replication.proto import replication_pb2_grpc
 from miniredis.replication.replicator import ReplicaServicer, sync_state_from_primary
+from miniredis.snapshot import SnapshotManager
 from miniredis.storage import Store
 from miniredis.time_sync.clock import SynchronizedClock
 from miniredis.time_sync.proto import time_pb2_grpc
@@ -71,6 +79,12 @@ class NodeConfig:
     reconcile_interval_seconds: float = 1.0
     # Test hook for simulating network faults: (rpc_name, target_address) -> allowed.
     rpc_filter: Optional[Callable[[str, str], bool]] = None
+    # M20 persistence: None disables the ledger (in-memory only, as before).
+    data_dir: Optional[str] = None
+    fsync_policy: str = "always"
+    fsync_interval_ms: Optional[int] = None
+    # M17 global snapshots
+    snapshot_timeout_ms: int = 5000
 
 
 class MiniRedisNode:
@@ -91,6 +105,12 @@ class MiniRedisNode:
         self.store = Store(clock=self.physical_clock.corrected_time_seconds)
         self.lamport_clock = LamportClock()
         self.progress = ReplicationProgress(node_id=self.node_id, role="replica", epoch=0)
+        self.ledger: Optional[WriteLedger] = (
+            WriteLedger(config.data_dir, config.fsync_policy, config.fsync_interval_ms)
+            if config.data_dir
+            else None
+        )
+        self.links = LinkManager(self.node_id, self._peers, rpc_filter=config.rpc_filter)
         self.write_gate = WriteAdmissionGate(can_serve_writes=False)
         self.write_gate.block_writes("joining cluster, leader not established yet")
 
@@ -167,8 +187,26 @@ class MiniRedisNode:
             primary_id_provider=lambda: election.current_primary_id,
             role_provider=lambda: election.role,
             on_newer_epoch=election.observe_higher_epoch,
+            ledger=self.ledger,
+            link_guard=LinkGuard(),
         )
         election.attach_state_syncer(self._sync_from)
+        election.attach_links(self.links)
+        self.dispatcher.set_ledger(self.ledger)
+
+        self.snapshots = SnapshotManager(
+            node_id=self.node_id,
+            peers=self._peers,
+            links=self.links,
+            capture_state=self._capture_snapshot_state,
+            epoch_provider=lambda: election.election_epoch,
+            commit_lock=self.dispatcher.commit_lock,
+            lamport_clock=self.lamport_clock,
+            default_timeout_ms=config.snapshot_timeout_ms,
+            rpc_filter=config.rpc_filter,
+        )
+        self.replica_servicer.attach_snapshot_manager(self.snapshots)
+        self.dispatcher.set_snapshot_manager(self.snapshots)
 
         self._reconciler = LeadershipReconciler(
             election=election,
@@ -195,7 +233,33 @@ class MiniRedisNode:
                 node_id=self.node_id,
                 require_primary=require_primary,
                 rpc_filter=self._config.rpc_filter,
+                ledger=self.ledger,
+                apply_guard=lambda: not self.snapshots.recording_active(),
             )
+
+    def _capture_snapshot_state(self) -> dict[str, Any]:
+        """Local state for a Chandy-Lamport snapshot (called synchronously)."""
+        assert self.election is not None
+        progress = self.progress.snapshot()
+        keys = {
+            key.decode("utf-8", errors="replace"): {
+                "value": value.decode("utf-8", errors="replace"),
+                "expires_at_ms": int(expires_at * 1000) if expires_at is not None else None,
+            }
+            for key, value, expires_at in self.store.snapshot_items()
+        }
+        return {
+            "role": self.election.role,
+            "election_epoch": self.election.election_epoch,
+            "current_primary": self.election.current_primary_id or None,
+            "epoch": progress.epoch,
+            "last_applied_sequence": progress.last_applied_sequence,
+            "history_digest": progress.history_digest,
+            "ledger": self.ledger.head() if self.ledger is not None else None,
+            "lamport": self.lamport_clock._value,
+            "key_count": len(keys),
+            "keys": keys,
+        }
 
     async def _on_follow(self, leader_id: str, peer: PeerEndpoint) -> None:
         """Point M14 clock synchronization at the leader being followed."""
@@ -252,6 +316,18 @@ class MiniRedisNode:
         """Start servers and begin joining the cluster (non-blocking)."""
         assert self.election is not None
         config = self._config
+
+        if self.ledger is not None:
+            # Recover before serving anything: peers and clients must only ever
+            # see the replayed state. Corruption raises and aborts the start.
+            records = self.ledger.open()
+            epoch, seq = replay(records, self.store, self.progress)
+            self.replica_servicer.reset_state(epoch, seq)
+            await self.ledger.start()
+            logger.info(
+                "Node %s replayed %d ledger records: epoch=%s seq=%s, %d keys",
+                self.node_id, len(records), epoch, seq, len(self.store.snapshot_items()),
+            )
 
         self._grpc_server = grpc.aio.server()
         mutex_pb2_grpc.add_MutexServiceServicer_to_server(
@@ -391,3 +467,6 @@ class MiniRedisNode:
             await self._tcp_server.wait_closed()
         if self._grpc_server is not None:
             await self._grpc_server.stop(grace=0)
+        await self.links.close()
+        if self.ledger is not None:
+            await self.ledger.close()
