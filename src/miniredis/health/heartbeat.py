@@ -17,6 +17,7 @@ from typing import Callable, Literal, Optional
 
 import grpc
 
+from miniredis.peer_channel import open_peer_channel
 from miniredis.health.proto import health_pb2
 from miniredis.health.proto import health_pb2_grpc
 from miniredis.logical_clock import LamportClock, log_lamport_event
@@ -39,10 +40,24 @@ class HealthServicer(health_pb2_grpc.HealthServiceServicer):
 		node_id: str,
 		role: Literal["primary", "replica"],
 		lamport_clock: Optional[LamportClock] = None,
+		role_provider: Optional[Callable[[], str]] = None,
 	) -> None:
 		self._node_id = node_id
 		self._role = role
 		self._lamport_clock = lamport_clock or LamportClock()
+		# When set, heartbeats report the live election role instead of the
+		# role the process was started with.
+		self._role_provider = role_provider
+
+	@property
+	def role(self) -> Literal["primary", "replica"]:
+		if self._role_provider is not None:
+			return self._role_provider()  # type: ignore[return-value]
+		return self._role
+
+	def set_role(self, role: Literal["primary", "replica"]) -> None:
+		self._role = role
+
 
 	async def Heartbeat(
 		self,
@@ -68,7 +83,7 @@ class HealthServicer(health_pb2_grpc.HealthServiceServicer):
 		)
 		return health_pb2.Pong(
 			responder_id=self._node_id,
-			role=self._role,
+			role=self.role,
 			timestamp_ms=_now_ms(),
 			lamport_timestamp=response_ts,
 		)
@@ -105,7 +120,7 @@ class FailureDetector:
 		self._rpc_filter = rpc_filter
 		self._lamport_clock = lamport_clock or LamportClock()
 
-		self._channel = grpc.aio.insecure_channel(peer_address)
+		self._channel = open_peer_channel(peer_address)
 		self._stub = health_pb2_grpc.HealthServiceStub(self._channel)
 		self._state: NodeState = "alive"
 		self._missed_heartbeats = 0
@@ -144,7 +159,7 @@ class FailureDetector:
 		self._peer_node_id = peer_node_id
 		self._peer_address = peer_address
 		self._missed_heartbeats = 0
-		self._channel = grpc.aio.insecure_channel(peer_address)
+		self._channel = open_peer_channel(peer_address)
 		self._stub = health_pb2_grpc.HealthServiceStub(self._channel)
 		await self._set_state("alive")
 

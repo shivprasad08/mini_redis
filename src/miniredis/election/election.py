@@ -15,11 +15,12 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import grpc
 
 from miniredis.cluster import WriteAdmissionGate, majority_count
+from miniredis.peer_channel import open_peer_channel
 from miniredis.dispatcher import Dispatcher
 from miniredis.health.heartbeat import FailureDetector
 from miniredis.health.proto import health_pb2
@@ -28,6 +29,8 @@ from miniredis.logical_clock import LamportClock, log_lamport_event
 from miniredis.replication.replicator import Replicator
 from miniredis.election.proto import election_pb2
 from miniredis.election.proto import election_pb2_grpc
+from miniredis.election.metrics import ElectionMetrics
+from miniredis.election.leadership import LeadershipMixin, next_epoch
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +44,7 @@ class PeerEndpoint:
 	tcp_address: str
 
 
-class BullyElection:
+class BullyElection(LeadershipMixin):
 	"""Coordinates Bully leader election for a single node."""
 
 	def __init__(
@@ -60,6 +63,9 @@ class BullyElection:
 		rpc_filter: Optional[Callable[[str, str], bool]] = None,
 		simulate_latency_ms: float = 0.0,
 		lamport_clock: Optional[LamportClock] = None,
+		progress: Optional[Any] = None,
+		lock_manager: Optional[Any] = None,
+		extra_replica_targets: Sequence[str] = (),
 	) -> None:
 		self._node_id = node_id
 		self._tcp_address = tcp_address
@@ -76,7 +82,19 @@ class BullyElection:
 		self._rpc_filter = rpc_filter
 		self._simulate_latency_ms = simulate_latency_ms
 		self._lamport_clock = lamport_clock or LamportClock()
+		self._progress = progress  # ReplicationProgress | None (M15)
+		self._lock_manager = lock_manager  # LockManager | None (M16)
+		# Replication targets outside the election peer set (legacy --replica-of).
+		self._extra_replica_targets = list(extra_replica_targets)
 		self._election_epoch = 0
+
+		# Metrics tracking for M18 comparison
+		self._last_metrics: Optional[ElectionMetrics] = None
+		self._election_start_time: float = 0.0
+		self._election_msg_count: int = 0
+		self._coordinator_msg_count: int = 0
+		self._retry_skip_count: int = 0
+		self._unavailable_nodes: int = 0
 
 		self._is_electing = False
 		self._election_lock = asyncio.Lock()
@@ -90,7 +108,7 @@ class BullyElection:
 		for peer_id, peer in self._peers.items():
 			if peer_id == self._node_id:
 				continue
-			channel = grpc.aio.insecure_channel(peer.grpc_address)
+			channel = open_peer_channel(peer.grpc_address)
 			self._channels[peer_id] = channel
 			self._stubs[peer_id] = election_pb2_grpc.ElectionServiceStub(channel)
 			self._health_stubs[peer_id] = health_pb2_grpc.HealthServiceStub(channel)
@@ -118,6 +136,10 @@ class BullyElection:
 	def attach_time_synchronizer(self, time_synchronizer: Optional[Any]) -> None:
 		"""Attach or replace the replica time synchronizer."""
 		self._time_synchronizer = time_synchronizer
+
+	def attach_lock_manager(self, lock_manager: Optional[Any]) -> None:
+		"""Attach or replace the lock manager for M16."""
+		self._lock_manager = lock_manager
 
 	@property
 	def node_id(self) -> str:
@@ -147,6 +169,10 @@ class BullyElection:
 	def election_epoch(self) -> int:
 		return self._election_epoch
 
+	def get_last_election_metrics(self) -> Optional[ElectionMetrics]:
+		"""Return message and timing metrics from the last completed election."""
+		return self._last_metrics
+
 	def _peer_is_higher_priority(self, peer_id: str) -> bool:
 		return peer_id > self._node_id
 
@@ -162,7 +188,13 @@ class BullyElection:
 		if self._role == "primary":
 			self._role = "replica"
 			self._dispatcher.set_writes_enabled(False)
+			replicator = self._dispatcher.replicator
 			self._dispatcher.set_replicator(None)
+			if replicator is not None:
+				await replicator.aclose()
+			# GetProgress must not keep advertising this node as primary.
+			if self._progress is not None:
+				self._progress.set_role("replica")
 
 	async def _has_cluster_majority(self) -> bool:
 		reachable_peers = 0
@@ -220,6 +252,11 @@ class BullyElection:
 			if self._is_electing:
 				return
 			self._is_electing = True
+			self._election_start_time = time.monotonic()
+			self._election_msg_count = 0
+			self._coordinator_msg_count = 0
+			self._retry_skip_count = 0
+			self._unavailable_nodes = 0
 
 		asyncio.create_task(self._run_election_round())
 
@@ -229,6 +266,11 @@ class BullyElection:
 			if self._is_electing:
 				return
 			self._is_electing = True
+			self._election_start_time = time.monotonic()
+			self._election_msg_count = 0
+			self._coordinator_msg_count = 0
+			self._retry_skip_count = 0
+			self._unavailable_nodes = 0
 
 		logger.info(f"[BULLY] Node {self._node_id} starting an election")
 		await self._run_election_round()
@@ -279,8 +321,10 @@ class BullyElection:
 		stub = self._stubs[peer_id]
 		peer = self._peers[peer_id]
 		if self._rpc_filter is not None and not self._rpc_filter("Election", peer.grpc_address):
+			self._retry_skip_count += 1
 			return False
 
+		self._election_msg_count += 1
 		request_ts = await self._lamport_clock.tick()
 		log_lamport_event(
 			timestamp=request_ts,
@@ -309,12 +353,50 @@ class BullyElection:
 			return bool(response.acknowledged)
 		except (asyncio.TimeoutError, grpc.aio.AioRpcError):
 			logger.debug("No election response from higher-priority peer %s", peer_id)
+			self._unavailable_nodes += 1
 			return False
 
 	async def _declare_victory(self) -> None:
 		logger.info("[BULLY] Node %s WON the election", self._node_id)
-		self._election_epoch = max(self._election_epoch + 1, time.time_ns())
+		# Priority is by node id, not by data: never announce leadership
+		# while a reachable peer holds newer state than this node.
+		if not await self._catch_up_before_leading():
+			logger.error(
+				"[BULLY] Node %s could not catch up with the most advanced peer; refusing to lead",
+				self._node_id,
+			)
+			async with self._election_lock:
+				self._is_electing = False
+			return
 
+		self._election_epoch = next_epoch(self._election_epoch)
+		await self._broadcast_coordinator()
+
+		duration = max(0.001, time.monotonic() - self._election_start_time)
+		total = self._election_msg_count + self._coordinator_msg_count + self._retry_skip_count
+		self._last_metrics = ElectionMetrics(
+			algorithm="bully",
+			election_id=f"bully-{self._node_id}",
+			initiator_id=self._node_id,
+			elected_leader=self._node_id,
+			epoch=self._election_epoch,
+			duration_seconds=duration,
+			initiation_messages=self._election_msg_count,
+			candidate_messages=self._election_msg_count,
+			coordinator_messages=self._coordinator_msg_count,
+			retry_or_skip_messages=self._retry_skip_count,
+			total_messages=total,
+			participating_nodes=max(1, len(self._peers) + 1 - self._unavailable_nodes),
+			unavailable_nodes=self._unavailable_nodes,
+		)
+
+		await self.promote_self()
+
+		async with self._election_lock:
+			self._is_electing = False
+
+	async def _broadcast_coordinator(self) -> None:
+		"""Announce this node as coordinator for the current epoch to every peer."""
 		coordinator_tasks = []
 		for peer_id, stub in self._stubs.items():
 			if peer_id == self._node_id:
@@ -330,10 +412,25 @@ class BullyElection:
 		if coordinator_tasks:
 			await asyncio.gather(*coordinator_tasks, return_exceptions=True)
 
-		await self.promote_self()
+	async def bootstrap_as_primary(self) -> bool:
+		"""Become the first primary of a brand-new cluster.
 
-		async with self._election_lock:
-			self._is_electing = False
+		Only valid while this process has never learned any leadership
+		(epoch 0, no known primary). The caller must already have checked
+		that no reachable peer reports an established epoch; promote_self
+		re-checks majority, so an isolated node still cannot lead.
+		"""
+		if not self._can_bootstrap():
+			return False
+		epoch = next_epoch(self._election_epoch)
+		self._election_epoch = epoch
+		await self.promote_self()
+		if self._role != "primary":
+			if self._election_epoch == epoch:
+				self._election_epoch = 0
+			return False
+		await self._broadcast_coordinator()
+		return True
 
 	async def _send_coordinator(
 		self,
@@ -342,8 +439,10 @@ class BullyElection:
 		tcp_address: str,
 	) -> None:
 		if self._rpc_filter is not None and not self._rpc_filter("Coordinator", grpc_address):
+			self._retry_skip_count += 1
 			return
 
+		self._coordinator_msg_count += 1
 		request_ts = await self._lamport_clock.tick()
 		log_lamport_event(
 			timestamp=request_ts,
@@ -372,6 +471,7 @@ class BullyElection:
 			)
 		except (asyncio.TimeoutError, grpc.aio.AioRpcError):
 			logger.debug("Coordinator announcement to %s timed out", tcp_address)
+			self._unavailable_nodes += 1
    
 	async def aclose(self) -> None:
 		"""Close every peer channel this election instance opened."""
@@ -397,9 +497,19 @@ class BullyElection:
 		self._current_primary_address = self._tcp_address
 		self._dispatcher.set_writes_enabled(True)
 
+		# Update progress tracker: new role and epoch (M15).
+		if self._progress is not None:
+			self._progress.update_role_and_epoch("primary", self._election_epoch)
+
+		# Update lock manager: promoted to primary (M16).
+		if self._lock_manager is not None and hasattr(self._lock_manager, "set_role"):
+			self._lock_manager.set_role("primary")
+
+		target_to_node_id = {peer.grpc_address: peer_id for peer_id, peer in self._peers.items()}
 		replica_targets = [
 			peer.grpc_address for peer_id, peer in self._peers.items() if peer_id != self._node_id
 		]
+		replica_targets += [t for t in self._extra_replica_targets if t not in replica_targets]
 		self._dispatcher.set_replicator(
 			Replicator(
 				replica_targets,
@@ -411,6 +521,9 @@ class BullyElection:
 				epoch=self._election_epoch,
 				node_id=self._node_id,
 				lamport_clock=self._lamport_clock,
+				progress=self._progress,
+				target_to_node_id=target_to_node_id,
+				on_higher_epoch=self.observe_higher_epoch,
 			)
 			if replica_targets
 			else None
@@ -454,14 +567,52 @@ class BullyElection:
 		self._role = "replica"
 		self._write_gate.block_writes("minority partition, refusing writes")
 		self._dispatcher.set_writes_enabled(False)
+		replicator = self._dispatcher.replicator
 		self._dispatcher.set_replicator(None)
+		if replicator is not None:
+			await replicator.aclose()
 
-		if self._failure_detector is not None:
+		# Update progress tracker: demoted to replica (M15).
+		if self._progress is not None:
+			self._progress.update_role_and_epoch("replica", election_epoch)
+
+		# Update lock manager: demoted to replica (M16).
+		if self._lock_manager is not None and hasattr(self._lock_manager, "set_role"):
 			peer = self._peers.get(new_primary_id)
 			detector_address = peer.grpc_address if peer is not None else new_primary_address
+			self._lock_manager.set_role("replica", primary_address=detector_address)
+
+		peer = self._peers.get(new_primary_id)
+		detector_address = peer.grpc_address if peer is not None else new_primary_address
+		if self._failure_detector is not None:
 			await self._failure_detector.update_peer(new_primary_id, detector_address)
 			if self._time_synchronizer is not None:
 				await self._time_synchronizer.update_peer(detector_address)
+		else:
+			from miniredis.health.heartbeat import FailureDetector
+			self._failure_detector = FailureDetector(
+				peer_node_id=new_primary_id,
+				peer_address=detector_address,
+				heartbeat_interval_seconds=1.0,
+				heartbeat_timeout_seconds=0.5,
+				failure_threshold=3,
+				sender_id=self._node_id,
+				rpc_filter=self._rpc_filter,
+				lamport_clock=self._lamport_clock,
+			)
+
+			def _log_state_change(peer_id: str, old_state: str, new_state: str) -> None:
+				del peer_id, old_state
+				if new_state == "suspected":
+					logger.warning("PRIMARY SUSPECTED DOWN")
+				elif new_state == "dead":
+					logger.error("PRIMARY DECLARED DEAD")
+					asyncio.create_task(self.start_election())
+				elif new_state == "alive":
+					logger.info("PRIMARY RECOVERED")
+
+			self._failure_detector.on_state_change(_log_state_change)
+			await self._failure_detector.start()
 
 		logger.info("Node %s now follows primary %s", self._node_id, new_primary_id)
 

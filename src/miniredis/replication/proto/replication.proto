@@ -3,6 +3,8 @@ package miniredis.replication;
 
 service ReplicationService {
   rpc ReplicateWrite (WriteOp) returns (Ack);
+  rpc GetProgress (ProgressRequest) returns (ProgressResponse);
+  rpc SyncSnapshot (SyncSnapshotRequest) returns (SyncSnapshotResponse);
 }
 
 message WriteOp {
@@ -14,6 +16,7 @@ message WriteOp {
   uint64 epoch = 6;        // monotonically increasing leadership epoch
   uint64 lamport_timestamp = 7;
   int64 expiry_deadline_ms = 8; // 0 if no TTL; corrected-clock absolute deadline
+  string fencing_token = 9;      // M16: optional fencing token for protected writes
 }
 
 message Ack {
@@ -21,4 +24,48 @@ message Ack {
   int64 applied_sequence = 2;
   uint64 epoch = 3;
   uint64 lamport_timestamp = 4;
+}
+
+// M15: Progress query messages
+
+message ProgressRequest {
+  string requester_node_id = 1;
+  uint64 lamport_timestamp = 2;
+}
+
+message ProgressResponse {
+  string node_id = 1;
+  string role = 2;
+  uint64 epoch = 3;
+  int64 last_applied_sequence = 4;
+  string history_digest = 5;
+  bool gap_detected = 6;
+  int64 gap_expected_sequence = 7;
+  int64 gap_observed_sequence = 8;
+  uint64 lamport_timestamp = 9;
+  string primary_node_id = 10;
+}
+
+// Safe state recovery and catch-up snapshot messages
+
+message SyncSnapshotRequest {
+  string requester_node_id = 1;
+  uint64 lamport_timestamp = 2;
+}
+
+message SnapshotItem {
+  string key = 1;
+  bytes value = 2;
+  int64 expiry_deadline_ms = 3;
+}
+
+message SyncSnapshotResponse {
+  string node_id = 1;
+  uint64 epoch = 2;
+  int64 sequence = 3;
+  string history_digest = 4;
+  repeated SnapshotItem items = 5;
+  uint64 lamport_timestamp = 6;
+  string role = 7;                            // serving node's role; only a primary snapshot is authoritative
+  map<string, string> fencing_watermarks = 8; // M16 fencing high-water marks, key -> token
 }

@@ -35,10 +35,7 @@ import logging
 import math
 from typing import Awaitable, Callable, Optional
 
-import grpc
-
 from miniredis.dispatcher import Dispatcher, pubsub_message_framer
-from miniredis.cluster import ClusterMajorityMonitor, WriteAdmissionGate
 from miniredis.protocol import (
     Command,
     CommandParser,
@@ -46,18 +43,9 @@ from miniredis.protocol import (
     encode_error,
     encode_simple_string,
 )
-from miniredis.election.election import BullyElection, PeerEndpoint
-from miniredis.election.proto import election_pb2_grpc
-from miniredis.logical_clock import LamportClock
+from miniredis.election.election import PeerEndpoint
 from miniredis.storage import Store
 from miniredis.pubsub import PubSub
-from miniredis.health.heartbeat import FailureDetector, HealthServicer
-from miniredis.health.proto import health_pb2_grpc
-from miniredis.replication.replicator import ReplicaServicer, Replicator
-from miniredis.replication.proto import replication_pb2_grpc
-from miniredis.time_sync.clock import SynchronizedClock
-from miniredis.time_sync.service import TimeServicer, TimeSynchronizer
-from miniredis.time_sync.proto import time_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +241,16 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="127.0.0.1", help="TCP bind address")
     parser.add_argument("--port", type=int, default=6380, help="TCP bind port")
     parser.add_argument("--grpc-port", type=int, default=6381, help="gRPC bind port")
-    parser.add_argument("--role", type=str, choices=["primary", "replica"], default="primary")
+    parser.add_argument(
+        "--role",
+        type=str,
+        choices=["primary", "replica"],
+        default="primary",
+        help=(
+            "Bootstrap hint: 'primary' may initialize a brand-new cluster. On restart the node "
+            "discovers and follows the current leader instead of trusting this flag."
+        ),
+    )
     parser.add_argument("--replica-of", action="append", default=[], help="Replica gRPC targets (host:port)")
     parser.add_argument("--node-id", type=str, default=None, help="Stable node identifier (defaults to host:grpc-port)")
     parser.add_argument("--primary-address", type=str, default=None, help="Primary gRPC address monitored by replicas")
@@ -288,6 +285,20 @@ def main() -> None:
         default=0.0,
         help="Simulated physical wall-clock skew for this node in milliseconds",
     )
+    parser.add_argument(
+        "--mutex-algo",
+        type=str,
+        choices=["ricart-agrawala", "centralized"],
+        default="ricart-agrawala",
+        help="Distributed mutual exclusion algorithm: ricart-agrawala or centralized",
+    )
+    parser.add_argument(
+        "--election-algo",
+        type=str,
+        choices=["bully", "ring"],
+        default="bully",
+        help="Distributed leader election algorithm: bully or ring (M18)",
+    )
     
     args = parser.parse_args()
 
@@ -306,160 +317,32 @@ def main() -> None:
         return PeerEndpoint(node_id=node_id, grpc_address=grpc_address, tcp_address=tcp_address)
 
     async def _run() -> None:
-        physical_clock = SynchronizedClock(skew_ms=args.clock_skew_ms)
-        store = Store(clock=physical_clock.corrected_time_seconds)
-        pubsub = PubSub(pubsub_message_framer)
-        node_id = args.node_id or f"{args.host}:{args.grpc_port}"
-        tcp_address = f"{args.host}:{args.port}"
-        grpc_address = f"{args.host}:{args.grpc_port}"
-        peer_map = {peer.node_id: peer for peer in (_parse_peer(descriptor) for descriptor in args.peer)}
-        total_cluster_size = len(peer_map) + 1
-        write_gate = WriteAdmissionGate(can_serve_writes=(args.role == "primary"))
-        lamport_clock = LamportClock()
+        # Local import: node.py imports run_server from this module.
+        from miniredis.node import MiniRedisNode, NodeConfig
 
-        grpc_server = grpc.aio.server()
-        replicator = None
-        failure_detector: FailureDetector | None = None
-        majority_monitor: ClusterMajorityMonitor | None = None
-        time_synchronizer: TimeSynchronizer | None = None
-
-        health_servicer = HealthServicer(node_id=node_id, role=args.role, lamport_clock=lamport_clock)
-        health_pb2_grpc.add_HealthServiceServicer_to_server(health_servicer, grpc_server)
-
-        replication_pb2_grpc.add_ReplicationServiceServicer_to_server(
-            ReplicaServicer(store, node_id=node_id, lamport_clock=lamport_clock), grpc_server
-        )
-        time_pb2_grpc.add_TimeServiceServicer_to_server(
-            TimeServicer(node_id=node_id, clock=physical_clock, lamport_clock=lamport_clock),
-            grpc_server,
-        )
-
-        election = BullyElection(
-            node_id=node_id,
-            tcp_address=tcp_address,
-            grpc_address=grpc_address,
-            peers=peer_map,
-            dispatcher=Dispatcher(
-                store,
-                pubsub,
-                writes_enabled=(args.role == "primary"),
-                write_gate=write_gate,
-                clock=physical_clock.corrected_time_seconds,
-            ),
-            total_cluster_size=total_cluster_size,
-            failure_detector=None,
-            write_gate=write_gate,
-            role=args.role,
-            write_mode=args.write_mode,
-            simulate_latency_ms=args.simulate_latency_ms,
-            lamport_clock=lamport_clock,
-        )
-        election_pb2_grpc.add_ElectionServiceServicer_to_server(election.servicer, grpc_server)
-
-        majority_monitor = ClusterMajorityMonitor(
-            node_id=node_id,
-            peer_health_addresses={peer_id: peer.grpc_address for peer_id, peer in peer_map.items()},
-            total_cluster_size=total_cluster_size,
-            gate=write_gate,
-            lamport_clock=lamport_clock,
-        )
-
-        async def _on_majority_change(majority_reachable: bool) -> None:
-            await election.handle_majority_change(majority_reachable)
-
-        majority_monitor.on_state_change(_on_majority_change)
-
-        grpc_server.add_insecure_port(grpc_address)
-        await grpc_server.start()
-        logger.info("gRPC server listening on %s", grpc_address)
-
-        await majority_monitor.start()
-        
-        if args.role == "primary":
-            replicator = Replicator(
-                args.replica_of,
-                total_cluster_size=total_cluster_size,
+        node = MiniRedisNode(
+            NodeConfig(
+                node_id=args.node_id,
+                host=args.host,
+                port=args.port,
+                grpc_port=args.grpc_port,
+                role=args.role,
+                replica_of=list(args.replica_of),
+                primary_address=args.primary_address,
+                primary_node_id=args.primary_node_id,
+                peers={peer.node_id: peer for peer in (_parse_peer(d) for d in args.peer)},
                 write_mode=args.write_mode,
                 simulate_latency_ms=args.simulate_latency_ms,
-                write_gate=write_gate,
-                node_id=node_id,
-                lamport_clock=lamport_clock,
+                clock_skew_ms=args.clock_skew_ms,
+                mutex_algo=args.mutex_algo,
+                election_algo=args.election_algo,
             )
-            election.dispatcher.set_replicator(replicator)
-        else:
-            primary_address = args.primary_address
-            if not primary_address:
-                raise ValueError("--primary-address is required when --role=replica")
-
-            primary_node_id = args.primary_node_id or primary_address
-
-            failure_detector = FailureDetector(
-                peer_node_id=primary_node_id,
-                peer_address=primary_address,
-                heartbeat_interval_seconds=1.0,
-                heartbeat_timeout_seconds=0.5,
-                failure_threshold=3,
-                sender_id=node_id,
-                rpc_filter=None,
-                lamport_clock=lamport_clock,
-            )
-
-            election.attach_failure_detector(failure_detector)
-            election.dispatcher.set_writes_enabled(False)
-
-            def _log_state_change(peer_id: str, old_state: str, new_state: str) -> None:
-                del peer_id, old_state
-                if new_state == "suspected":
-                    logger.warning("PRIMARY SUSPECTED DOWN")
-                elif new_state == "dead":
-                    logger.error("PRIMARY DECLARED DEAD")
-                    asyncio.create_task(election.start_election())
-                elif new_state == "alive":
-                    logger.info("PRIMARY RECOVERED")
-
-            failure_detector.on_state_change(_log_state_change)
-            await failure_detector.start()
-
-            time_synchronizer = TimeSynchronizer(
-                node_id=node_id,
-                peer_address=primary_address,
-                clock=physical_clock,
-                interval_seconds=1.0,
-                timeout_seconds=0.5,
-                lamport_clock=lamport_clock,
-            )
-            election.attach_time_synchronizer(time_synchronizer)
-            await time_synchronizer.start()
-
-        dispatcher = election.dispatcher
-        if args.role == "primary":
-            dispatcher.set_writes_enabled(True)
-            dispatcher.set_replicator(replicator)
-
-        tcp_server = await run_server(
-            host=args.host, 
-            port=args.port, 
-            handler=dispatcher.handle_command,
-            on_disconnect=dispatcher.handle_disconnect,
         )
-        
+        await node.start()
         try:
-            async with tcp_server:
-                await asyncio.gather(
-                    tcp_server.serve_forever(),
-                    grpc_server.wait_for_termination(),
-                )
+            await node.serve_forever()
         finally:
-            if majority_monitor is not None:
-                await majority_monitor.stop()
-            if failure_detector is not None:
-                await failure_detector.stop()
-            if time_synchronizer is not None:
-                await time_synchronizer.stop()
-            if replicator is not None:
-                await replicator.aclose()
-            if grpc_server:
-                await grpc_server.stop(grace=0)
+            await node.stop()
 
     try:
         asyncio.run(_run())

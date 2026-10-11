@@ -28,12 +28,15 @@ stale keys occupying memory until they are next touched.
 from __future__ import annotations
 
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 
 # Type alias for a clock function — enables deterministic testing
 # without monkey-patching ``time.monotonic`` globally.
 ClockFn = Callable[[], float]
+
+
+from miniredis.mutex.protocol import FencingToken, FencingWatermarkError
 
 
 class Store:
@@ -52,6 +55,7 @@ class Store:
         self._data: dict[bytes, bytes] = {}
         self._expiries: dict[bytes, float] = {}
         self._clock: ClockFn = clock or time.monotonic
+        self._fencing_watermarks: dict[bytes, Any] = {}
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -114,6 +118,79 @@ class Store:
         """Return ``True`` if *key* exists and has not expired."""
         self._evict_if_expired(key)
         return key in self._data
+
+    # ── fencing watermark methods (M16) ─────────────────────────────
+
+    def get_watermark(self, key: bytes) -> Optional[Any]:
+        """Return the current fencing high-water mark for *key*, if any."""
+        return self._fencing_watermarks.get(key)
+
+    def check_and_update_watermark(self, key: bytes, token: Any) -> Any:
+        """Validate and record *token* as the highest accepted token for *key*.
+
+        Raises FencingWatermarkError if *token* is older than or equal to
+        the recorded high-water mark for *key*.
+        """
+        from miniredis.mutex.protocol import FencingToken
+
+        parsed_token = FencingToken.from_str(token)
+        current = self._fencing_watermarks.get(key)
+        if current is not None:
+            current_parsed = FencingToken.from_str(current)
+            if parsed_token <= current_parsed:
+                raise FencingWatermarkError(
+                    f"stale fencing token {parsed_token}: current high-water mark is {current_parsed}"
+                )
+        self._fencing_watermarks[key] = parsed_token
+        return parsed_token
+
+    def fenced_set(
+        self,
+        key: bytes,
+        value: bytes,
+        token: Any,
+        ttl_seconds: Optional[int] = None,
+        expires_at: Optional[float] = None,
+    ) -> Any:
+        """Perform a protected write validated against the fencing-token watermark.
+
+        If *token* is stale or invalid, FencingWatermarkError is raised and
+        no mutation occurs.
+        """
+        parsed_token = self.check_and_update_watermark(key, token)
+        self.set(key, value, ttl_seconds=ttl_seconds, expires_at=expires_at)
+        return parsed_token
+
+    # ── snapshot support (replica rejoin) ───────────────────────────
+
+    def snapshot_items(self) -> list[tuple[bytes, bytes, Optional[float]]]:
+        """Return ``(key, value, expires_at)`` for every live key."""
+        items = []
+        for key in list(self._data):
+            if self._is_expired(key):
+                continue
+            items.append((key, self._data[key], self._expiries.get(key)))
+        return items
+
+    def fencing_watermarks(self) -> dict[bytes, str]:
+        """Return every fencing high-water mark in its string form."""
+        return {key: str(token) for key, token in self._fencing_watermarks.items()}
+
+    def replace_all(
+        self,
+        items: list[tuple[bytes, bytes, Optional[float]]],
+        fencing_watermarks: Optional[dict[bytes, str]] = None,
+    ) -> None:
+        """Atomically replace the whole keyspace with a leader snapshot."""
+        from miniredis.mutex.protocol import FencingToken
+
+        self._data.clear()
+        self._expiries.clear()
+        self._fencing_watermarks.clear()
+        for key, value, expires_at in items:
+            self.set(key, value, expires_at=expires_at)
+        for key, token in (fencing_watermarks or {}).items():
+            self._fencing_watermarks[key] = FencingToken.from_str(token)
 
     # ── internal helpers ────────────────────────────────────────────
 

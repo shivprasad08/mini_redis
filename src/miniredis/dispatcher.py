@@ -16,13 +16,18 @@ Supported commands
 * ``EXISTS key``               → integer (0 or 1)
 * ``SUBSCRIBE channel``        → array ``["subscribe", channel, count]``
 * ``PUBLISH channel message``  → integer (delivered count)
+* ``STALENESS``                → bulk string (JSON cluster report) — M15
 * anything else                → ``-ERR unknown command '<name>'``
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from typing import Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 from miniredis.protocol import (
     Command,
@@ -60,6 +65,8 @@ class Dispatcher:
         writes_enabled: bool = True,
         write_gate: Optional[WriteAdmissionGate] = None,
         clock: Optional[Callable[[], float]] = None,
+        progress=None,  # Optional[ReplicationProgress] — avoid circular import at module level
+        lock_manager=None,  # Optional[BaseLockManager] — M16 mutual exclusion
     ) -> None:
         self._store = store
         self._pubsub = pubsub
@@ -67,6 +74,8 @@ class Dispatcher:
         self._writes_enabled = writes_enabled
         self._write_gate = write_gate or WriteAdmissionGate(can_serve_writes=writes_enabled)
         self._clock = clock
+        self._progress = progress  # ReplicationProgress | None
+        self._lock_manager = lock_manager
 
     def set_replicator(self, replicator: Optional[Replicator]) -> None:
         """Swap the replication backend at runtime."""
@@ -83,6 +92,19 @@ class Dispatcher:
             self._write_gate.allow_writes()
         else:
             self._write_gate.block_writes("node is not primary")
+
+    @property
+    def writes_enabled(self) -> bool:
+        """Return whether client write commands are currently permitted."""
+        return self._writes_enabled
+
+    def set_progress(self, progress) -> None:
+        """Attach or replace the shared progress tracker."""
+        self._progress = progress
+
+    def set_lock_manager(self, lock_manager) -> None:
+        """Attach or replace the lock manager for M16."""
+        self._lock_manager = lock_manager
 
     @property
     def write_gate(self) -> WriteAdmissionGate:
@@ -105,6 +127,10 @@ class Dispatcher:
             "EXISTS": self._handle_exists,
             "SUBSCRIBE": self._handle_subscribe,
             "PUBLISH": self._handle_publish,
+            "STALENESS": self._handle_staleness,
+            "LOCK": self._handle_lock,
+            "UNLOCK": self._handle_unlock,
+            "FENCED_SET": self._handle_fenced_set,
         }
 
         handler = dispatch.get(command.name)
@@ -183,6 +209,18 @@ class Dispatcher:
             expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
         )
 
+        # Record the primary's local application in the progress tracker.
+        if self._replicator is not None and self._progress is not None:
+            self._replicator.record_primary_applied(
+                epoch=self._replicator.epoch,
+                sequence=self._replicator.last_sequence(),
+                op_type="SET",
+                key=key,
+                value=value,
+                ttl_seconds=ttl or 0,
+                expiry_deadline_ms=expiry_deadline_ms,
+            )
+
         return encode_simple_string("OK")
 
     async def _handle_del(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
@@ -204,6 +242,16 @@ class Dispatcher:
                 return encode_error("ERR quorum not reached, write not applied")
 
         count = self._store.delete(key) if existed else 0
+
+        # Record primary-side applied write.
+        if existed and count and self._replicator is not None and self._progress is not None:
+            self._replicator.record_primary_applied(
+                epoch=self._replicator.epoch,
+                sequence=self._replicator.last_sequence(),
+                op_type="DEL",
+                key=key,
+                value=b"",
+            )
 
         return encode_integer(count)
 
@@ -249,6 +297,18 @@ class Dispatcher:
             else self._store.expire(key, seconds) if existed else 0
         )
 
+        # Record primary-side applied write.
+        if existed and result and self._replicator is not None and self._progress is not None:
+            self._replicator.record_primary_applied(
+                epoch=self._replicator.epoch,
+                sequence=self._replicator.last_sequence(),
+                op_type="EXPIRE",
+                key=key,
+                value=b"",
+                ttl_seconds=seconds,
+                expiry_deadline_ms=expiry_deadline_ms,
+            )
+
         return encode_integer(result)
 
     def _handle_exists(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
@@ -281,3 +341,185 @@ class Dispatcher:
         
         delivered = await self._pubsub.publish(channel, message)
         return encode_integer(delivered)
+
+    async def _handle_staleness(
+        self, command: Command, writer: asyncio.StreamWriter
+    ) -> bytes:
+        """Return a JSON cluster staleness report.
+
+        Only the current primary can serve this command.  A replica or
+        unconfigured node returns an informative error.
+        """
+        if len(command.args) != 0:
+            return encode_error(
+                "ERR wrong number of arguments for 'STALENESS' command"
+            )
+
+        if not self._writes_enabled:
+            return encode_error(
+                "ERR STALENESS must be run on the primary node"
+            )
+
+        if self._replicator is None:
+            # Primary with no replica configuration — return local-only report.
+            if self._progress is not None:
+                snap = self._progress.snapshot()
+            else:
+                return encode_error(
+                    "ERR no replication configured on this node"
+                )
+            report = {
+                "primary_node_id": snap.node_id,
+                "primary_epoch": snap.epoch,
+                "primary_last_applied_sequence": snap.last_applied_sequence,
+                "nodes": [
+                    {
+                        "node_id": snap.node_id,
+                        "role": "primary",
+                        "epoch": snap.epoch,
+                        "last_applied_sequence": snap.last_applied_sequence,
+                        "history_digest": snap.history_digest,
+                        "status": "LOCAL_PRIMARY",
+                        "lag": 0,
+                    }
+                ],
+            }
+            return encode_bulk_string(json.dumps(report, indent=2).encode("utf-8"))
+
+        if self._progress is None:
+            return encode_error(
+                "ERR progress tracking is not initialised on this node"
+            )
+
+        from miniredis.staleness import collect_staleness_report
+
+        # Take a snapshot of primary progress before any RPC (consistent baseline).
+        primary_snapshot = self._progress.snapshot()
+
+        try:
+            report = await collect_staleness_report(
+                primary_snapshot=primary_snapshot,
+                replicator=self._replicator,
+            )
+        except Exception as exc:
+            logger.error("Failed to collect staleness report: %s", exc, exc_info=True)
+            return encode_error(f"ERR staleness collection failed: {exc}")
+
+        return encode_bulk_string(json.dumps(report, indent=2).encode("utf-8"))
+
+    async def _handle_lock(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """Acquire a distributed or centralized lock on a resource."""
+        if len(command.args) != 1:
+            return encode_error("ERR wrong number of arguments for 'LOCK' command")
+
+        if self._lock_manager is None:
+            return encode_error("ERR lock service not available")
+
+        resource_id = command.args[0].decode("utf-8", errors="replace")
+        peername = writer.get_extra_info("peername")
+        client_id = f"{peername[0]}:{peername[1]}" if peername else ""
+
+        try:
+            token = await self._lock_manager.acquire(resource_id, client_id=client_id)
+            return encode_bulk_string(str(token).encode("utf-8"))
+        except Exception as exc:
+            return encode_error(f"ERR lock acquisition failed: {exc}")
+
+    async def _handle_unlock(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """Release a held lock on a resource."""
+        if len(command.args) not in (1, 2):
+            return encode_error("ERR wrong number of arguments for 'UNLOCK' command")
+
+        if self._lock_manager is None:
+            return encode_error("ERR lock service not available")
+
+        resource_id = command.args[0].decode("utf-8", errors="replace")
+        token = command.args[1].decode("utf-8", errors="replace") if len(command.args) == 2 else None
+        peername = writer.get_extra_info("peername")
+        client_id = f"{peername[0]}:{peername[1]}" if peername else ""
+
+        try:
+            await self._lock_manager.release(resource_id, token=token, client_id=client_id)
+            return encode_simple_string("OK")
+        except Exception as exc:
+            return encode_error(f"ERR unlock failed: {exc}")
+
+    async def _handle_fenced_set(self, command: Command, writer: asyncio.StreamWriter) -> bytes:
+        """Perform a protected write validated by a fencing token."""
+        # FENCED_SET key value token [EX seconds]
+        if len(command.args) not in (3, 5):
+            return encode_error("ERR wrong number of arguments for 'FENCED_SET' command")
+
+        if not self._write_gate.can_serve_writes:
+            return encode_error(f"READONLY {self._write_gate.reason}")
+
+        key = command.args[0]
+        value = command.args[1]
+        token_str = command.args[2].decode("utf-8", errors="replace")
+
+        ttl: Optional[int] = None
+        if len(command.args) == 5:
+            opt = command.args[3].upper()
+            if opt != b"EX":
+                return encode_error(f"ERR syntax error: unexpected option '{command.args[3].decode(errors='replace')}'")
+            try:
+                ttl = int(command.args[4])
+                if ttl <= 0:
+                    return encode_error("ERR invalid expire time in 'FENCED_SET' command")
+            except ValueError:
+                return encode_error("ERR value is not an integer or out of range")
+
+        from miniredis.mutex.protocol import FencingToken, FencingWatermarkError
+
+        try:
+            token = FencingToken.from_str(token_str)
+        except Exception:
+            return encode_error("ERR invalid fencing token format")
+
+        # Validate against existing watermark before applying mutation
+        current_wm = self._store.get_watermark(key)
+        if current_wm is not None:
+            try:
+                current_parsed = FencingToken.from_str(current_wm)
+                if token <= current_parsed:
+                    return encode_error(
+                        f"ERR stale fencing token {token} (current high-water mark is {current_parsed})"
+                    )
+            except Exception:
+                pass
+
+        expiry_deadline_ms = 0
+        if ttl is not None and self._clock is not None:
+            expiry_deadline_ms = int((self._clock() + ttl) * 1000)
+
+        if self._replicator is not None:
+            quorum_ok = await self._replicator.propagate_write(
+                "SET", key, value, ttl_seconds=ttl or 0, expiry_deadline_ms=expiry_deadline_ms, fencing_token=str(token)
+            )
+            if not quorum_ok:
+                return encode_error(f"READONLY quorum write failed: {self._write_gate.reason}")
+
+        try:
+            self._store.fenced_set(
+                key,
+                value,
+                token,
+                ttl_seconds=ttl,
+                expires_at=(expiry_deadline_ms / 1000.0 if expiry_deadline_ms else None),
+            )
+        except FencingWatermarkError as exc:
+            return encode_error(f"ERR {exc}")
+
+        # Record primary applied write in progress tracker
+        if self._replicator is not None and self._progress is not None:
+            self._replicator.record_primary_applied(
+                epoch=self._replicator.epoch,
+                sequence=self._replicator.last_sequence(),
+                op_type="SET",
+                key=key,
+                value=value,
+                ttl_seconds=ttl or 0,
+                expiry_deadline_ms=expiry_deadline_ms,
+            )
+
+        return encode_simple_string("OK")

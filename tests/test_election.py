@@ -241,9 +241,9 @@ async def test_primary_death_triggers_highest_priority_replacement() -> None:
 @pytest.mark.asyncio
 async def test_concurrent_elections_converge_on_one_winner() -> None:
     topology = {
-        "node-a": ("127.0.0.1:42001", "127.0.0.1:52001"),
-        "node-b": ("127.0.0.1:42002", "127.0.0.1:52002"),
-        "node-c": ("127.0.0.1:42003", "127.0.0.1:52003"),
+        "node-a": ("127.0.0.1:42001", "127.0.0.1:46001"),
+        "node-b": ("127.0.0.1:42002", "127.0.0.1:46002"),
+        "node-c": ("127.0.0.1:42003", "127.0.0.1:46003"),
     }
     peers = _peer_map(topology)
 
@@ -297,10 +297,10 @@ async def test_concurrent_elections_converge_on_one_winner() -> None:
 @pytest.mark.asyncio
 async def test_late_rejoin_does_not_self_promote_from_stale_state() -> None:
     topology = {
-        "node-a": ("127.0.0.1:43001", "127.0.0.1:53001"),
-        "node-b": ("127.0.0.1:43002", "127.0.0.1:53002"),
-        "node-c": ("127.0.0.1:43003", "127.0.0.1:53003"),
-        "node-d": ("127.0.0.1:43004", "127.0.0.1:53004"),
+        "node-a": ("127.0.0.1:43001", "127.0.0.1:47001"),
+        "node-b": ("127.0.0.1:43002", "127.0.0.1:47002"),
+        "node-c": ("127.0.0.1:43003", "127.0.0.1:47003"),
+        "node-d": ("127.0.0.1:43004", "127.0.0.1:47004"),
     }
     # node-d hasn't joined the cluster yet at election time — only a/b/c
     # form the real cluster whose majority math must be satisfied.

@@ -1,0 +1,21 @@
+# Example terraform.tfvars
+# Copy this file to terraform.tfvars and customize before running terraform plan / apply
+
+aws_region   = "us-east-1"
+cluster_name = "mini-redis"
+instance_type = "t3.small"
+
+# Required: Restrict admin SSH and Redis port access to your IP address (e.g., "203.0.113.50/32")
+# Wildcard 0.0.0.0/0 is explicitly rejected by Terraform input validation
+admin_cidr   = "203.0.113.50/32"
+
+# Optional: Dedicated CIDR for Redis clients (defaults to admin_cidr if left empty)
+client_cidr  = ""
+
+# Optional: Add your SSH public key to enable SSH login (e.g. "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5...")
+ssh_public_key = ""
+
+# Cluster configuration
+election_algo = "bully"
+mutex_algo    = "ricart-agrawala"
+write_mode    = "async"

@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package miniredis.mutex;
+
+service MutexService {
+    rpc RequestLock (LockRequest) returns (LockResponse);
+    rpc RequestReply (ReplyMessage) returns (ReplyAck);
+    rpc ReleaseLock (ReleaseRequest) returns (ReleaseResponse);
+    rpc GetLockStatus (LockStatusRequest) returns (LockStatusResponse);
+}
+
+message LockRequest {
+    string requesting_node_id = 1;
+    string resource_id = 2;
+    string request_id = 3;
+    uint64 election_epoch = 4;
+    uint64 lamport_timestamp = 5;
+    string client_id = 6;
+    bool centralized = 7;
+}
+
+message LockResponse {
+    bool granted = 1;
+    bool deferred = 2;
+    string responder_node_id = 3;
+    string request_id = 4;
+    uint64 lamport_timestamp = 5;
+    string fencing_token = 6;
+    string error_message = 7;
+}
+
+message ReplyMessage {
+    string responder_node_id = 1;
+    string requesting_node_id = 2;
+    string resource_id = 3;
+    string request_id = 4;
+    bool granted = 5;
+    uint64 lamport_timestamp = 6;
+}
+
+message ReplyAck {
+    bool acknowledged = 1;
+    uint64 lamport_timestamp = 2;
+}
+
+message ReleaseRequest {
+    string requesting_node_id = 1;
+    string resource_id = 2;
+    string request_id = 3;
+    string fencing_token = 4;
+    string client_id = 5;
+    uint64 election_epoch = 6;
+    uint64 lamport_timestamp = 7;
+    bool centralized = 8;
+}
+
+message ReleaseResponse {
+    bool success = 1;
+    string error_message = 2;
+    uint64 lamport_timestamp = 3;
+}
+
+message LockStatusRequest {
+    string resource_id = 1;
+    uint64 lamport_timestamp = 2;
+}
+
+message LockStatusResponse {
+    string resource_id = 1;
+    string state = 2;              // RELEASED, WANTED, HELD
+    string current_holder = 3;
+    string fencing_token = 4;
+    uint64 lamport_timestamp = 5;
+}

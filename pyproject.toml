@@ -22,6 +22,8 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# One event loop for the whole session; see tests/conftest.py for why.
+asyncio_default_fixture_loop_scope = "session"
 
 [project.scripts]
 miniredis-server = "miniredis.server:main"

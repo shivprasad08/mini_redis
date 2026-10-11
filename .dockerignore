@@ -1,0 +1,43 @@
+# Version control
+.git/
+.gitignore
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & temp
+*.log
+*.err.log
+
+# Terraform & AWS
+infra/aws/.terraform/
+infra/aws/*.tfstate
+infra/aws/*.tfstate.*
+infra/aws/*.tfvars
+
+# Documentation & IDE
+docs/
+.vscode/
+.idea/
+
+# Exclude generated gRPC files from build context to ensure Dockerfile compiles them cleanly from .proto
+src/miniredis/**/*_pb2.py
+src/miniredis/**/*_pb2.pyi
+src/miniredis/**/*_pb2_grpc.py

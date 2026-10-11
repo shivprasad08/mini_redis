@@ -20,6 +20,7 @@ import grpc
 from miniredis.health.proto import health_pb2
 from miniredis.health.proto import health_pb2_grpc
 from miniredis.logical_clock import LamportClock, log_lamport_event
+from miniredis.peer_channel import open_peer_channel
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ class ClusterMajorityMonitor:
         for peer_id, peer_address in self._peer_health_addresses.items():
             if peer_id == self._node_id:
                 continue
-            channel = grpc.aio.insecure_channel(peer_address)
+            channel = open_peer_channel(peer_address)
             self._channels.append(channel)
             self._stubs[peer_id] = health_pb2_grpc.HealthServiceStub(channel)
 

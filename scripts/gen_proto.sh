@@ -11,6 +11,7 @@ python -m grpc_tools.protoc \
     src/miniredis/election/proto/election.proto \
     src/miniredis/health/proto/health.proto \
     src/miniredis/replication/proto/replication.proto \
-    src/miniredis/time_sync/proto/time.proto
+    src/miniredis/time_sync/proto/time.proto \
+    src/miniredis/mutex/proto/mutex.proto
 
 echo "Done."

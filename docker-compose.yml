@@ -1,21 +1,30 @@
 # docker-compose.yml
 #
-# Multi-node mini-redis cluster topology:
-# - 1 Primary node (node-a)
-# - 3 Replica nodes (node-b, node-c, node-d)
+# Multi-node mini-redis cluster topology (3 Nodes):
+# - Node A (node-a): bootstrap primary of a brand-new cluster
+# - Node B (node-b): Replica
+# - Node C (node-c): Replica
 #
-# Inter-node gRPC communication uses Docker container hostnames on the shared
-# 'miniredis-net' bridge network instead of loopback IPs.
+# --role is only a bootstrap hint. On every start a node first asks its peers
+# (GetProgress) for an established leadership epoch: if one exists it follows
+# the confirmed leader and pulls its snapshot, whatever --role says. Only when
+# no peer reports leadership and a majority is reachable does node-a initialize
+# the cluster. So `docker compose stop node-a` / `start node-a` after a failover
+# rejoins node-a as a replica of the current leader instead of a second primary.
 #
-# Client-facing TCP ports published to host:
-# - Primary (node-a): host port 6380 -> container port 6380
-# - Replica 1 (node-b): host port 6381 -> container port 6380
-# - Replica 2 (node-c): host port 6382 -> container port 6380
-# - Replica 3 (node-d): host port 6383 -> container port 6380
+# Inter-node communication uses Docker container hostnames on the shared
+# 'miniredis-net' bridge network.
+#
+# Host-accessible client TCP ports:
+# - node-a: ${NODE_A_PORT:-6380} -> 6380
+# - node-b: ${NODE_B_PORT:-6381} -> 6380
+# - node-c: ${NODE_C_PORT:-6382} -> 6380
 
 services:
   node-a:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: miniredis-node-a
     hostname: node-a
     command: >
@@ -26,17 +35,29 @@ services:
       --grpc-port 6381
       --replica-of node-b:6381
       --replica-of node-c:6381
-      --replica-of node-d:6381
       --peer node-b,node-b:6381,node-b:6380
       --peer node-c,node-c:6381,node-c:6380
-      --peer node-d,node-d:6381,node-d:6380
+      --write-mode ${WRITE_MODE:-async}
+      --mutex-algo ${MUTEX_ALGO:-ricart-agrawala}
+      --election-algo ${ELECTION_ALGO:-bully}
+      --simulate-latency-ms ${SIMULATE_LATENCY_MS:-0.0}
+      --clock-skew-ms ${CLOCK_SKEW_MS:-0.0}
     ports:
-      - "6380:6380"
+      - "${NODE_A_PORT:-6380}:6380"
     networks:
       - miniredis-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s = socket.create_connection((\"127.0.0.1\", 6380), timeout=2); s.sendall(b\"*1\\r\\n$$4\\r\\nPING\\r\\n\"); resp = s.recv(1024); assert b\"+PONG\" in resp; s.close()'"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    restart: on-failure
 
   node-b:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: miniredis-node-b
     hostname: node-b
     command: >
@@ -49,16 +70,27 @@ services:
       --primary-node-id node-a
       --peer node-a,node-a:6381,node-a:6380
       --peer node-c,node-c:6381,node-c:6380
-      --peer node-d,node-d:6381,node-d:6380
+      --write-mode ${WRITE_MODE:-async}
+      --mutex-algo ${MUTEX_ALGO:-ricart-agrawala}
+      --election-algo ${ELECTION_ALGO:-bully}
+      --simulate-latency-ms ${SIMULATE_LATENCY_MS:-0.0}
+      --clock-skew-ms ${CLOCK_SKEW_MS:-0.0}
     ports:
-      - "6381:6380"
-    depends_on:
-      - node-a
+      - "${NODE_B_PORT:-6381}:6380"
     networks:
       - miniredis-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s = socket.create_connection((\"127.0.0.1\", 6380), timeout=2); s.sendall(b\"*1\\r\\n$$4\\r\\nPING\\r\\n\"); resp = s.recv(1024); assert b\"+PONG\" in resp; s.close()'"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    restart: on-failure
 
   node-c:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: miniredis-node-c
     hostname: node-c
     command: >
@@ -71,35 +103,22 @@ services:
       --primary-node-id node-a
       --peer node-a,node-a:6381,node-a:6380
       --peer node-b,node-b:6381,node-b:6380
-      --peer node-d,node-d:6381,node-d:6380
+      --write-mode ${WRITE_MODE:-async}
+      --mutex-algo ${MUTEX_ALGO:-ricart-agrawala}
+      --election-algo ${ELECTION_ALGO:-bully}
+      --simulate-latency-ms ${SIMULATE_LATENCY_MS:-0.0}
+      --clock-skew-ms ${CLOCK_SKEW_MS:-0.0}
     ports:
-      - "6382:6380"
-    depends_on:
-      - node-a
+      - "${NODE_C_PORT:-6382}:6380"
     networks:
       - miniredis-net
-
-  node-d:
-    build: .
-    container_name: miniredis-node-d
-    hostname: node-d
-    command: >
-      --role replica
-      --node-id node-d
-      --host 0.0.0.0
-      --port 6380
-      --grpc-port 6381
-      --primary-address node-a:6381
-      --primary-node-id node-a
-      --peer node-a,node-a:6381,node-a:6380
-      --peer node-b,node-b:6381,node-b:6380
-      --peer node-c,node-c:6381,node-c:6380
-    ports:
-      - "6383:6380"
-    depends_on:
-      - node-a
-    networks:
-      - miniredis-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s = socket.create_connection((\"127.0.0.1\", 6380), timeout=2); s.sendall(b\"*1\\r\\n$$4\\r\\nPING\\r\\n\"); resp = s.recv(1024); assert b\"+PONG\" in resp; s.close()'"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
+    restart: on-failure
 
 networks:
   miniredis-net:

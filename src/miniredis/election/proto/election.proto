@@ -5,6 +5,8 @@ package miniredis.election;
 service ElectionService {
 	rpc Election (ElectionMessage) returns (ElectionAck);
 	rpc Coordinator (CoordinatorMessage) returns (CoordinatorAck);
+	rpc RingElection (RingElectionMessage) returns (RingElectionAck);
+	rpc RingCoordinator (RingCoordinatorMessage) returns (RingCoordinatorAck);
 }
 
 message ElectionMessage {
@@ -26,6 +28,36 @@ message CoordinatorMessage {
 }
 
 message CoordinatorAck {
+	bool acknowledged = 1;
+	uint64 lamport_timestamp = 2;
+}
+
+// M18: Chang-Roberts Ring Election messages
+
+message RingElectionMessage {
+	string sender_id = 1;
+	string election_id = 2;
+	string candidate_id = 3;
+	uint64 election_epoch = 4;
+	uint64 lamport_timestamp = 5;
+	repeated string visited_nodes = 6;
+}
+
+message RingElectionAck {
+	bool acknowledged = 1;
+	uint64 lamport_timestamp = 2;
+}
+
+message RingCoordinatorMessage {
+	string sender_id = 1;
+	string new_primary_id = 2;
+	string new_primary_address = 3;
+	uint64 election_epoch = 4;
+	uint64 lamport_timestamp = 5;
+	repeated string visited_nodes = 6;
+}
+
+message RingCoordinatorAck {
 	bool acknowledged = 1;
 	uint64 lamport_timestamp = 2;
 }
