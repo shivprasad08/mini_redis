@@ -16,3 +16,22 @@ venv.bak/
 *_pb2.py
 *_pb2.pyi
 *_pb2_grpc.py
+
+# Terraform local state and generated artifacts
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+infra/aws/terraform.tfvars
+infra/aws/terraform.tfvars.json
+
+# Terraform local state and generated artifacts
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+infra/aws/terraform.tfvars
+infra/aws/terraform.tfvars.json
+
+# Terraform plan file without extension
+tfplan
